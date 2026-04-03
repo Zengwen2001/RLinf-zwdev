@@ -255,6 +255,7 @@ class EmbodiedRunner:
             # set global step
             self.actor.set_global_step(self.global_step)
             self.rollout.set_global_step(self.global_step)
+            self.env.set_global_step(self.global_step) 
 
             with self.timer("step"):
                 with self.timer("sync_weights"):

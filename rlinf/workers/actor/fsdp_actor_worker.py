@@ -24,6 +24,7 @@ from torch import nn
 from torch.distributed.tensor import DTensor
 from torch.multiprocessing.reductions import reduce_tensor
 from torch.utils import _pytree
+from rlinf.utils.timeline_trace import append_timeline_event
 
 import rlinf.algorithms  # noqa: F401
 from rlinf.algorithms.registry import calculate_adv_and_returns, policy_loss
@@ -1369,6 +1370,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
                 self.optimizer.zero_grad()
                 for idx, batch in enumerate(train_micro_batch):
+                    t0 = time.time()
                     batch = put_tensor_device(
                         batch,
                         f"{Worker.torch_device_type}:{int(os.environ['LOCAL_RANK'])}",
@@ -1472,6 +1474,17 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
                     metrics_data["actor/total_loss"] = loss.detach().item()
                     append_to_dict(metrics, metrics_data)
+
+                    t1 = time.time()
+                    append_timeline_event(
+                        self.cfg,
+                        component="actor",
+                        rank=self._rank,
+                        tag=f"mbatch_{idx}",
+                        t0=t0,
+                        t1=t1,
+                        global_step=self.version,
+                    )
 
                 self.torch_platform.empty_cache()
 

@@ -35,6 +35,8 @@ from rlinf.utils.comm_mapping import CommMapper
 from rlinf.utils.metric_utils import compute_split_num
 from rlinf.utils.nested_dict_process import update_nested_cfg
 from rlinf.utils.placement import HybridComponentPlacement
+import time
+from rlinf.utils.timeline_trace import append_timeline_event
 
 
 class EnvWorker(Worker):
@@ -79,6 +81,10 @@ class EnvWorker(Worker):
             // self.cfg.actor.model.num_action_chunks
         )
         self.actor_split_num = self.get_actor_split_num()
+        self._global_step = 0
+
+    def set_global_step(self, global_step: int) -> None:
+        self._global_step = global_step
 
     def init_worker(self):
         self.dst_ranks = {
@@ -686,7 +692,7 @@ class EnvWorker(Worker):
                     },
                 )
 
-            for _ in range(self.n_train_chunk_steps):
+            for chunk_step in range(self.n_train_chunk_steps):
                 for stage_id in range(self.stage_num):
                     if cooperative_yield:
                         await asyncio.sleep(0)
@@ -698,6 +704,8 @@ class EnvWorker(Worker):
                             env_output.intervene_actions,
                             env_output.intervene_flags,
                         )
+
+                    t0 = time.time()
 
                     rollout_result = self.recv_rollout_results(
                         input_channel, mode="train"
@@ -737,6 +745,17 @@ class EnvWorker(Worker):
                             "final_obs": env_batch["final_obs"],
                         },
                     )
+                    t1 = time.time()
+                    append_timeline_event(
+                        self.cfg,
+                        component="env",
+                        rank=self._rank,
+                        tag=f"env_chunk_e{epoch}_cs{chunk_step}_st{stage_id}",
+                        t0=t0,
+                        t1=t1,
+                        global_step=getattr(self, "_global_step", None),
+                    )
+        
                     if self.collect_transitions:
                         next_obs = (
                             env_output.final_obs
@@ -758,6 +777,8 @@ class EnvWorker(Worker):
                         env_output.intervene_flags,
                     )
 
+                time0 = time.time()
+
                 rollout_result = self.recv_rollout_results(input_channel, mode="train")
                 rewards = self.compute_bootstrap_rewards(
                     env_output, rollout_result.bootstrap_values
@@ -772,6 +793,16 @@ class EnvWorker(Worker):
                     rewards=rewards,
                 )
                 self.rollout_results[stage_id].append_step_result(chunk_step_result)
+                time1 = time.time()
+                append_timeline_event(
+                    self.cfg,
+                    component="env",
+                    rank=self._rank,
+                    tag=f"recv_rollout_results_e{epoch}_st{stage_id}",
+                    t0=time0,
+                    t1=time1,
+                    global_step=getattr(self, "_global_step", None),
+                )
 
             self.store_last_obs_and_intervened_info(env_outputs)
             self.finish_rollout()

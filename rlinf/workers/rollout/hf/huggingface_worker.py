@@ -30,6 +30,8 @@ from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, CollectiveGroupOptions, Worker
 from rlinf.utils.comm_mapping import CommMapper
 from rlinf.utils.placement import HybridComponentPlacement
+import time
+from rlinf.utils.timeline_trace import append_timeline_event
 
 
 class MultiStepRolloutWorker(Worker):
@@ -348,12 +350,28 @@ class MultiStepRolloutWorker(Worker):
         self.torch_platform.empty_cache()
 
     @Worker.timer("generate_one_epoch")
-    async def generate_one_epoch(self, input_channel: Channel, output_channel: Channel):
+    async def generate_one_epoch(
+        self,
+        input_channel: Channel,
+        output_channel: Channel,
+        rollout_epoch_idx: int,
+    ):
         self.update_dagger_beta()
-        for _ in range(self.n_train_chunk_steps):
-            for _ in range(self.num_pipeline_stages):
+        for chunk_step in range(self.n_train_chunk_steps):
+            for stage_idx in range(self.num_pipeline_stages):
                 env_output = await self.recv_env_output(input_channel)
+                t0 = time.time()
                 actions, result = self.predict(env_output["obs"])
+                t1 = time.time()
+                append_timeline_event(
+                    self.cfg,
+                    component="rollout",
+                    rank=self._rank,
+                    tag=f"predict_e{rollout_epoch_idx}_cs{chunk_step}_st{stage_idx}",
+                    t0=t0,
+                    t1=t1,
+                    global_step=getattr(self, "version", None),
+                )
 
                 save_flags = None
                 if result.get("expert_label_flag", False):
@@ -383,9 +401,20 @@ class MultiStepRolloutWorker(Worker):
                     ),
                 )
                 self.send_rollout_result(output_channel, rollout_result, mode="train")
-        for _ in range(self.num_pipeline_stages):
+        for stage_idx in range(self.num_pipeline_stages):
             env_output = await self.recv_env_output(input_channel)
+            t0 = time.time()
             actions, result = self.predict(env_output["obs"])
+            t1 = time.time()
+            append_timeline_event(
+                self.cfg,
+                component="rollout",
+                rank=self._rank,
+                tag=f"predict_tail_e{rollout_epoch_idx}_st{stage_idx}",
+                t0=t0,
+                t1=t1,
+                global_step=getattr(self, "version", None),
+            )
 
             rollout_result = RolloutResult(
                 actions=actions,
@@ -404,12 +433,14 @@ class MultiStepRolloutWorker(Worker):
         if self.enable_offload:
             self.reload_model()
 
-        for _ in tqdm(
+        for rollout_epoch_idx in tqdm(
             range(self.rollout_epoch),
             desc="Generating Rollout Epochs",
             disable=(self._rank != 0),
         ):
-            await self.generate_one_epoch(input_channel, output_channel)
+            await self.generate_one_epoch(
+                input_channel, output_channel, rollout_epoch_idx
+            )
 
         if self.enable_offload:
             self.offload_model()
