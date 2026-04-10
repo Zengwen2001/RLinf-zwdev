@@ -14,6 +14,7 @@
 
 import copy
 import gc
+import os
 from typing import Any, Literal
 
 import numpy as np
@@ -32,6 +33,20 @@ from rlinf.utils.comm_mapping import CommMapper
 from rlinf.utils.placement import HybridComponentPlacement
 import time
 from rlinf.utils.timeline_trace import append_timeline_event
+
+# Profiler configuration via environment variables
+# ROLLOUT_ENABLE_PROFILER: Set to "1" to enable profiler
+# ROLLOUT_PROFILER_OUTPUT_DIR: Output directory for profiler results (default: ./profiler_logs)
+# ROLLOUT_PROFILER_WARMUP_STEPS: Number of warmup steps before profiling (default: 50)
+# ROLLOUT_PROFILER_NUM_STEPS: Number of steps to profile after warmup (default: 1)
+# ROLLOUT_PROFILER_RANK: Only profile on this rank (default: 0). Set to -1 to profile all ranks.
+# ROLLOUT_PROFILER_USE_CUDA: Set to "1" to use CUDA profiler (may have NCCL issues), default uses CPU-only profiler
+ROLLOUT_ENABLE_PROFILER = os.environ.get("ROLLOUT_ENABLE_PROFILER", "0") == "1"
+ROLLOUT_PROFILER_OUTPUT_DIR = os.environ.get("ROLLOUT_PROFILER_OUTPUT_DIR", "./profiler_logs")
+ROLLOUT_PROFILER_WARMUP_STEPS = int(os.environ.get("ROLLOUT_PROFILER_WARMUP_STEPS", "50"))
+ROLLOUT_PROFILER_NUM_STEPS = int(os.environ.get("ROLLOUT_PROFILER_NUM_STEPS", "1"))
+ROLLOUT_PROFILER_RANK = int(os.environ.get("ROLLOUT_PROFILER_RANK", "0"))
+ROLLOUT_PROFILER_USE_CUDA = os.environ.get("ROLLOUT_PROFILER_USE_CUDA", "1") == "1"
 
 
 class MultiStepRolloutWorker(Worker):
@@ -85,6 +100,64 @@ class MultiStepRolloutWorker(Worker):
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
         self.version = 0
         self.finished_episodes = None
+
+        # Profiler state - initialized in init_worker
+        self._profiler_step_count = 0
+        self._profiler = None
+
+    def _should_profile(self) -> bool:
+        """Check if profiler should be active for this step."""
+        if not ROLLOUT_ENABLE_PROFILER:
+            return False
+
+        # Check rank filter
+        if ROLLOUT_PROFILER_RANK >= 0 and self._rank != ROLLOUT_PROFILER_RANK:
+            return False
+
+        # Still in warmup phase
+        if self._profiler_step_count < ROLLOUT_PROFILER_WARMUP_STEPS:
+            return False
+        # Already profiled enough steps
+        profiled_steps = self._profiler_step_count - ROLLOUT_PROFILER_WARMUP_STEPS
+        if profiled_steps >= ROLLOUT_PROFILER_NUM_STEPS:
+            return False
+        return True
+
+    def _setup_profiler(self):
+        """Setup profiler for this step if needed."""
+        if not self._should_profile():
+            return None
+
+        profiled_steps = self._profiler_step_count - ROLLOUT_PROFILER_WARMUP_STEPS
+        os.makedirs(ROLLOUT_PROFILER_OUTPUT_DIR, exist_ok=True)
+        trace_file = os.path.join(
+            ROLLOUT_PROFILER_OUTPUT_DIR,
+            f"rollout_rank{self._rank}_step{profiled_steps}.json"
+        )
+        self.log_info(f"[Profiler] Starting trace for rank {self._rank} step {profiled_steps} "
+                     f"(total_call={self._profiler_step_count})")
+
+        # Create profiler without on_trace_ready callback
+        self._profiler_trace_file = trace_file
+
+        # Use CPU-only profiler by default to avoid NCCL thread issues
+        # Set ROLLOUT_PROFILER_USE_CUDA=1 to enable CUDA profiling (may cause errors)
+        if ROLLOUT_PROFILER_USE_CUDA:
+            activities = [
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ]
+        else:
+            activities = [
+                torch.profiler.ProfilerActivity.CPU,
+            ]
+
+        return torch.profiler.profile(
+            activities=activities,
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        )
 
     def init_worker(self):
         rollout_model_config = copy.deepcopy(self.cfg.actor.model)
@@ -149,6 +222,13 @@ class MultiStepRolloutWorker(Worker):
         self.setup_sample_params()
         if self.enable_offload:
             self.offload_model()
+
+        # Initialize profiler state
+        if ROLLOUT_ENABLE_PROFILER:
+            rank_info = f"rank {ROLLOUT_PROFILER_RANK}" if ROLLOUT_PROFILER_RANK >= 0 else "all ranks"
+            self.log_info(f"[Profiler] Enabled for {rank_info}. Output dir: {ROLLOUT_PROFILER_OUTPUT_DIR}, "
+                         f"warmup_steps: {ROLLOUT_PROFILER_WARMUP_STEPS}, "
+                         f"num_steps: {ROLLOUT_PROFILER_NUM_STEPS}")
 
     def setup_sample_params(self):
         # length parameters for rollout
@@ -244,6 +324,30 @@ class MultiStepRolloutWorker(Worker):
     def predict(
         self, env_obs: dict[str, Any], mode: Literal["train", "eval"] = "train"
     ) -> tuple[torch.Tensor, dict[str, Any]]:
+        # Setup profiler for this step if needed
+        profiler = self._setup_profiler()
+
+        if profiler is not None:
+            with profiler:
+                actions, result = self._predict_impl(env_obs, mode)
+            # Export trace after context exit
+            profiler.export_chrome_trace(self._profiler_trace_file)
+            self._profiler_step_count += 1
+            profiled_steps = self._profiler_step_count - ROLLOUT_PROFILER_WARMUP_STEPS
+            if profiled_steps >= ROLLOUT_PROFILER_NUM_STEPS:
+                self.log_info(f"[Profiler] Finished profiling {ROLLOUT_PROFILER_NUM_STEPS} steps. "
+                             f"Results saved to {ROLLOUT_PROFILER_OUTPUT_DIR}")
+        else:
+            # Always increment step count for warmup tracking
+            self._profiler_step_count += 1
+            actions, result = self._predict_impl(env_obs, mode)
+
+        return actions, result
+
+    def _predict_impl(
+        self, env_obs: dict[str, Any], mode: Literal["train", "eval"] = "train"
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Implementation of predict without profiler wrapper."""
         kwargs = (
             self._train_sampling_params
             if mode == "train"

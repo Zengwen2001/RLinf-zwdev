@@ -15,7 +15,9 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor,env,rollout: all
+    actor: all
+    env: all
+    rollout: all
 
 runner:
   task_type: embodied
@@ -90,7 +92,7 @@ env:
 
   # Override the default values in env/libero_goal
   train:
-    total_num_envs: 64
+    total_num_envs: 128
     max_episode_steps: 320 # max episode steps for truncation
     max_steps_per_rollout_epoch: 320
   eval:
