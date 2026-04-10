@@ -667,6 +667,9 @@ install_behavior_env() {
 
     pushd "$behavior_dir" >/dev/null
     UV_LINK_MODE=hardlink ./setup.sh --omnigibson --bddl --joylo --confirm-no-conda --accept-nvidia-eula --use-uv
+    # OmniGibson's eval deps need another commit of lerobot, which is in conflict with which rlinf needs.
+    # We actually does not use OmniGibson's lerobot deps, so just install other deps in OmniGibson's eval deps. 
+    uv pip install "dm_tree>=0.1.9" "hydra-core>=1.3.2" "websockets>=15.0.1" "msgpack>=1.1.0" "gspread>=6.2.1" "open3d>=0.19.0" av "numpy<2"
     popd >/dev/null
     uv pip uninstall flash-attn || true
     uv pip install ml_dtypes==0.5.3 protobuf==3.20.3
@@ -846,7 +849,7 @@ install_frankasim_env() {
 
 install_habitat_env() {
     local habitat_sim_dir
-    habitat_sim_dir=$(clone_or_reuse_repo HABITAT_SIM_PATH "$VENV_DIR/habitat" https://github.com/facebookresearch/habitat-sim.git -b v0.3,3 --recurse-submodules)
+    habitat_sim_dir=$(clone_or_reuse_repo HABITAT_SIM_PATH "$VENV_DIR/habitat" https://github.com/facebookresearch/habitat-sim.git -b v0.3.3 --recurse-submodules)
     if [ -d "$habitat_sim_dir/build" ]; then
         rm -rf $habitat_sim_dir/build
     fi
