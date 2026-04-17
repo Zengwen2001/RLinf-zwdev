@@ -658,6 +658,140 @@ class LiberoEnv(gym.Env):
             infos_list,
         )
 
+    def step_subset(self, actions, env_idx, auto_reset=True):
+        if isinstance(actions, torch.Tensor):
+            actions = actions.detach().cpu().numpy()
+        env_idx = np.asarray(env_idx, dtype=np.int32)
+
+        self._elapsed_steps[env_idx] += 1
+        raw_obs, _reward, terminations, info_lists = self.env.step(actions, env_idx)
+        if self.current_raw_obs is None:
+            self.current_raw_obs = [None] * self.num_envs
+        for i, idx in enumerate(env_idx):
+            self.current_raw_obs[idx] = raw_obs[i]
+
+        infos = list_of_dict_to_dict_of_list(info_lists)
+        truncations = self.elapsed_steps[env_idx] >= self.cfg.max_episode_steps
+        obs = self._wrap_obs(raw_obs)
+
+        step_penalty = -1 if self.use_step_penalty else 0
+        reward = step_penalty + self.cfg.reward_coef * terminations
+        if self.use_rel_reward:
+            reward_diff = reward - self.prev_step_reward[env_idx]
+            self.prev_step_reward[env_idx] = reward
+            step_reward = reward_diff
+        else:
+            step_reward = reward
+
+        self.returns[env_idx] += step_reward
+        self.success_once[env_idx] = self.success_once[env_idx] | terminations
+        episode_info = {
+            "success_once": self.success_once[env_idx].copy(),
+            "return": self.returns[env_idx].copy(),
+            "episode_len": self.elapsed_steps[env_idx].copy(),
+        }
+        episode_info["reward"] = episode_info["return"] / episode_info["episode_len"]
+        infos["episode"] = to_tensor(episode_info)
+        if self.ignore_terminations:
+            infos["episode"]["success_at_end"] = to_tensor(terminations)
+            terminations[:] = False
+
+        dones = terminations | truncations
+        _auto_reset = auto_reset and self.auto_reset
+        if dones.any() and _auto_reset:
+            final_obs = copy.deepcopy(obs)
+            final_info = copy.deepcopy(infos)
+            done_env_idx = env_idx[dones]
+            if self.cfg.is_eval:
+                self.update_reset_state_ids()
+            obs, infos = self.reset(
+                env_idx=done_env_idx,
+                reset_state_ids=self.reset_state_ids[done_env_idx]
+                if self.use_fixed_reset_state_ids
+                else None,
+            )
+            obs = self._wrap_obs([self.current_raw_obs[idx] for idx in env_idx])
+            infos["final_observation"] = final_obs
+            infos["final_info"] = final_info
+            infos["_final_info"] = dones
+            infos["_final_observation"] = dones
+            infos["_elapsed_steps"] = dones
+
+        return (
+            obs,
+            to_tensor(step_reward),
+            to_tensor(terminations),
+            to_tensor(truncations),
+            infos,
+        )
+
+    def chunk_step_subset(self, chunk_actions, env_idx):
+        env_idx = np.asarray(env_idx, dtype=np.int32)
+        chunk_size = chunk_actions.shape[1]
+        obs_list = []
+        infos_list = []
+        chunk_rewards = []
+        raw_chunk_terminations = []
+        raw_chunk_truncations = []
+
+        for i in range(chunk_size):
+            actions = chunk_actions[:, i]
+            extracted_obs, step_reward, terminations, truncations, infos = self.step_subset(
+                actions,
+                env_idx,
+                auto_reset=False,
+            )
+            obs_list.append(extracted_obs)
+            infos_list.append(infos)
+            chunk_rewards.append(step_reward)
+            raw_chunk_terminations.append(terminations)
+            raw_chunk_truncations.append(truncations)
+
+        chunk_rewards = torch.stack(chunk_rewards, dim=1)
+        raw_chunk_terminations = torch.stack(raw_chunk_terminations, dim=1)
+        raw_chunk_truncations = torch.stack(raw_chunk_truncations, dim=1)
+
+        past_terminations = raw_chunk_terminations.any(dim=1)
+        past_truncations = raw_chunk_truncations.any(dim=1)
+        past_dones = torch.logical_or(past_terminations, past_truncations)
+
+        if past_dones.any() and self.auto_reset:
+            final_obs = copy.deepcopy(obs_list[-1])
+            final_info = copy.deepcopy(infos_list[-1])
+            done_env_idx = env_idx[past_dones.cpu().numpy()]
+            if self.cfg.is_eval:
+                self.update_reset_state_ids()
+            reset_obs, reset_infos = self.reset(
+                env_idx=done_env_idx,
+                reset_state_ids=self.reset_state_ids[done_env_idx]
+                if self.use_fixed_reset_state_ids
+                else None,
+            )
+            infos_list[-1] = reset_infos
+            infos_list[-1]["final_observation"] = final_obs
+            infos_list[-1]["final_info"] = final_info
+            infos_list[-1]["_final_info"] = past_dones.cpu().numpy()
+            infos_list[-1]["_final_observation"] = past_dones.cpu().numpy()
+            infos_list[-1]["_elapsed_steps"] = past_dones.cpu().numpy()
+            obs_list[-1] = self._wrap_obs([self.current_raw_obs[idx] for idx in env_idx])
+
+        if self.auto_reset or self.ignore_terminations:
+            chunk_terminations = torch.zeros_like(raw_chunk_terminations)
+            chunk_terminations[:, -1] = past_terminations
+            chunk_truncations = torch.zeros_like(raw_chunk_truncations)
+            chunk_truncations[:, -1] = past_truncations
+        else:
+            chunk_terminations = raw_chunk_terminations.clone()
+            chunk_truncations = raw_chunk_truncations.clone()
+
+        return (
+            obs_list,
+            chunk_rewards,
+            chunk_terminations,
+            chunk_truncations,
+            infos_list,
+        )
+
     def _handle_auto_reset(self, dones, _final_obs, infos):
         final_obs = copy.deepcopy(_final_obs)
         env_idx = np.arange(0, self.num_envs)[dones]

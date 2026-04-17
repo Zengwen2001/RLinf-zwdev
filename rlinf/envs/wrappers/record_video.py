@@ -405,6 +405,13 @@ class RecordVideo(gym.Wrapper):
                 self.add_new_frames(obs_list, infos_list, rewards, terminations)
         return result
 
+    def chunk_step_subset(self, *args, **kwargs):
+        """Step a subset chunk and record the frames belonging to that subset."""
+        # Disaggregated VLM-AE pipeline steps subsets of envs independently.
+        # Recording those partial batches would change tiled frame sizes across
+        # time and break MP4 encoding, so we temporarily skip subset recording.
+        return self.env.chunk_step_subset(*args, **kwargs)
+
     def flush_video(self, video_sub_dir: Optional[str] = None):
         """Write buffered frames to an MP4 file (async)."""
         if not self.render_images:

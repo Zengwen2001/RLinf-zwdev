@@ -92,9 +92,11 @@ env:
 
   # Override the default values in env/libero_goal
   train:
-    total_num_envs: 128
+    total_num_envs: 32
     max_episode_steps: 320 # max episode steps for truncation
     max_steps_per_rollout_epoch: 320
+    video_cfg:
+      save_video: False
   eval:
     total_num_envs: 64
     auto_reset: True
@@ -115,6 +117,9 @@ rollout:
   unnorm_key: libero_10
   enable_offload: False
   pipeline_stage_num: 1
+
+  enable_torch_compile: True
+  torch_compile_mode: "max-autotune"
 
   model:
     model_path: "/mnt/public/zengwen/RLinf-Pi05-LIBERO-SFT" # https://huggingface.co/RLinf/RLinf-Pi05-LIBERO-SFT

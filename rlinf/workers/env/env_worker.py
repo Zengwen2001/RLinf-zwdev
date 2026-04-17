@@ -14,6 +14,7 @@
 
 import asyncio
 from collections import defaultdict
+import os
 from typing import Any, Literal
 
 import numpy as np
@@ -30,6 +31,15 @@ from rlinf.data.embodied_io_struct import (
 from rlinf.envs import get_env_cls
 from rlinf.envs.action_utils import prepare_actions
 from rlinf.envs.wrappers import RecordVideo
+from rlinf.models.embodiment.openpi.vlm_ae_disagg import (
+    MicroSliceSpec,
+    get_ae_to_env_micro_dst_slices,
+    get_env_from_ae_src_ranks,
+    get_env_from_ae_micro_src_slices,
+    get_env_to_vlm_dst_ranks,
+    get_env_to_vlm_micro_dst_slices,
+    is_disagg_enabled,
+)
 from rlinf.scheduler import Channel, Cluster, Worker
 from rlinf.utils.comm_mapping import CommMapper
 from rlinf.utils.metric_utils import compute_split_num
@@ -82,6 +92,14 @@ class EnvWorker(Worker):
         )
         self.actor_split_num = self.get_actor_split_num()
         self._global_step = 0
+        self._vlm_ae_disagg_enabled = False
+        self._baseline_micro_pipeline_enabled = (
+            os.environ.get("VLM_AE_BASELINE_MICROPIPE", "0") == "1"
+        )
+        self._vlm_ae_aux_dst_ranks: dict[str, list[tuple[int, int]]] = {}
+        self._vlm_ae_num_micro_batches = 1
+        self._vlm_ae_env_to_vlm_micro_specs: dict[str, dict[int, list[MicroSliceSpec]]] = {}
+        self._vlm_ae_from_ae_micro_specs: dict[str, dict[int, list[MicroSliceSpec]]] = {}
 
     def set_global_step(self, global_step: int) -> None:
         self._global_step = global_step
@@ -105,6 +123,54 @@ class EnvWorker(Worker):
             self.src_ranks["eval"] = self._setup_src_ranks(
                 self.cfg.env.eval.total_num_envs // self.stage_num
             )
+
+        self._vlm_ae_disagg_enabled = is_disagg_enabled()
+        if self._vlm_ae_disagg_enabled:
+            self._baseline_micro_pipeline_enabled = False
+        if self._vlm_ae_disagg_enabled:
+            env_world_size = self._component_placement.get_world_size("env")
+            train_stage_batch_size = self.cfg.env.train.total_num_envs // self.stage_num
+            self._vlm_ae_num_micro_batches = int(
+                os.environ.get("VLM_AE_NUM_MICRO_BATCHES", "2")
+            )
+            self.dst_ranks["train"] = get_env_to_vlm_dst_ranks(
+                train_stage_batch_size, env_world_size, self._rank
+            )
+            self.src_ranks["train"] = get_env_from_ae_src_ranks(
+                train_stage_batch_size, env_world_size, self._rank
+            )
+            self._vlm_ae_env_to_vlm_micro_specs["train"] = (
+                get_env_to_vlm_micro_dst_slices(
+                    train_stage_batch_size,
+                    env_world_size,
+                    self._rank,
+                    self._vlm_ae_num_micro_batches,
+                )
+            )
+            self._vlm_ae_from_ae_micro_specs["train"] = (
+                get_env_from_ae_micro_src_slices(
+                    train_stage_batch_size,
+                    env_world_size,
+                    self._rank,
+                    self._vlm_ae_num_micro_batches,
+                )
+            )
+        elif self._baseline_micro_pipeline_enabled:
+            train_stage_batch_size = self.cfg.env.train.total_num_envs // self.stage_num
+            self._vlm_ae_num_micro_batches = int(
+                os.environ.get("VLM_AE_NUM_MICRO_BATCHES", "2")
+            )
+            local_batch_size = train_stage_batch_size // self._world_size
+            if local_batch_size % self._vlm_ae_num_micro_batches != 0:
+                raise ValueError(
+                    f"Baseline micro pipeline requires local batch size {local_batch_size} "
+                    f"to be divisible by num_micro_batches={self._vlm_ae_num_micro_batches}."
+                )
+            if len(self.dst_ranks["train"]) != 1 or len(self.src_ranks["train"]) != 1:
+                raise ValueError(
+                    "Baseline micro pipeline currently requires 1:1 env<->rollout mapping."
+                )
+
         self.log_info(f"Env worker initialized with dst_ranks: {self.dst_ranks}")
         self.log_info(f"Env worker initialized with src_ranks: {self.src_ranks}")
         train_env_cls = get_env_cls(self.cfg.env.train.env_type, self.cfg.env.train)
@@ -368,6 +434,76 @@ class EnvWorker(Worker):
         )
         return env_output, env_info
 
+    def env_interact_micro_step(
+        self,
+        raw_actions: torch.Tensor,
+        stage_id: int,
+        start: int,
+        end: int,
+    ) -> tuple[EnvOutput, dict[str, Any]]:
+        env = self.env_list[stage_id]
+        if not hasattr(env, "chunk_step_subset"):
+            raise NotImplementedError(
+                f"VLM-AE micro-batch env stepping requires chunk_step_subset(), "
+                f"but env type {type(env).__name__} does not provide it."
+            )
+
+        chunk_actions = prepare_actions(
+            raw_chunk_actions=raw_actions,
+            env_type=self.cfg.env.train.env_type,
+            model_type=self.cfg.actor.model.model_type,
+            num_action_chunks=self.cfg.actor.model.num_action_chunks,
+            action_dim=self.cfg.actor.model.action_dim,
+            policy=self.cfg.actor.model.get("policy_setup", None),
+            wm_env_type=self.cfg.env.train.get("wm_env_type", None),
+        )
+        env_idx = np.arange(start, end, dtype=np.int32)
+        env_info = {}
+
+        obs_list, chunk_rewards, chunk_terminations, chunk_truncations, infos_list = (
+            env.chunk_step_subset(chunk_actions, env_idx)
+        )
+        extracted_obs = obs_list[-1] if isinstance(obs_list, (list, tuple)) else None
+        infos = infos_list[-1] if isinstance(infos_list, (list, tuple)) else None
+        chunk_dones = torch.logical_or(chunk_terminations, chunk_truncations)
+
+        if not self.cfg.env.train.auto_reset:
+            if self.cfg.env.train.ignore_terminations:
+                if chunk_truncations[:, -1].any() and "episode" in infos:
+                    for key in infos["episode"]:
+                        env_info[key] = infos["episode"][key].cpu()
+            else:
+                if "episode" in infos:
+                    for key in infos["episode"]:
+                        env_info[key] = infos["episode"][key].cpu()
+        elif chunk_dones.any() and "final_info" in infos:
+            final_info = infos["final_info"]
+            for key in final_info["episode"]:
+                env_info[key] = final_info["episode"][key][chunk_dones[:, -1]].cpu()
+
+        intervene_actions = (
+            infos["intervene_action"] if "intervene_action" in infos else None
+        )
+        intervene_flags = infos["intervene_flag"] if "intervene_flag" in infos else None
+        if self.cfg.env.train.auto_reset and chunk_dones.any():
+            if "intervene_action" in infos["final_info"]:
+                intervene_actions = infos["final_info"]["intervene_action"]
+                intervene_flags = infos["final_info"]["intervene_flag"]
+
+        env_output = EnvOutput(
+            obs=extracted_obs,
+            final_obs=infos["final_observation"]
+            if "final_observation" in infos
+            else None,
+            rewards=chunk_rewards,
+            dones=chunk_dones,
+            terminations=chunk_terminations,
+            truncations=chunk_truncations,
+            intervene_actions=intervene_actions,
+            intervene_flags=intervene_flags,
+        )
+        return env_output, env_info
+
     def recv_chunk_actions(self, input_channel: Channel, mode="train") -> np.ndarray:
         """Receive and merge chunked actions for the current env worker.
 
@@ -558,6 +694,310 @@ class EnvWorker(Worker):
 
         return splitted_env_batches
 
+    @staticmethod
+    def _slice_nested_batch(value: Any, start: int, end: int) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            return value[start:end].contiguous()
+        if isinstance(value, list):
+            return value[start:end]
+        if isinstance(value, dict):
+            return {
+                key: EnvWorker._slice_nested_batch(sub_value, start, end)
+                for key, sub_value in value.items()
+            }
+        return value
+
+    def _slice_env_batch(
+        self, env_batch: dict[str, Any], start: int, end: int
+    ) -> dict[str, Any]:
+        return {
+            key: self._slice_nested_batch(value, start, end)
+            for key, value in env_batch.items()
+        }
+
+    def _slice_env_output(self, env_output: EnvOutput, start: int, end: int) -> EnvOutput:
+        return EnvOutput(
+            obs=self._slice_nested_batch(env_output.obs, start, end),
+            final_obs=self._slice_nested_batch(env_output.final_obs, start, end),
+            rewards=self._slice_nested_batch(env_output.rewards, start, end),
+            dones=self._slice_nested_batch(env_output.dones, start, end),
+            terminations=self._slice_nested_batch(env_output.terminations, start, end),
+            truncations=self._slice_nested_batch(env_output.truncations, start, end),
+            intervene_actions=self._slice_nested_batch(
+                env_output.intervene_actions, start, end
+            ),
+            intervene_flags=self._slice_nested_batch(env_output.intervene_flags, start, end),
+        )
+
+    def _infer_local_env_batch_size(self, env_output: EnvOutput) -> int:
+        obs = env_output.obs
+        if isinstance(obs, dict):
+            for value in obs.values():
+                if isinstance(value, torch.Tensor):
+                    return value.shape[0]
+                if isinstance(value, list):
+                    return len(value)
+        raise ValueError("Cannot infer local env batch size from env output.")
+
+    def _initialize_missing_tensor_field(
+        self, env_output: EnvOutput, update: torch.Tensor
+    ) -> torch.Tensor:
+        batch_size = self._infer_local_env_batch_size(env_output)
+        return torch.zeros(
+            (batch_size, *update.shape[1:]),
+            dtype=update.dtype,
+            device=update.device,
+        )
+
+    @staticmethod
+    def _replace_nested_slice(base: Any, update: Any, start: int, end: int) -> Any:
+        if base is None:
+            return update
+        if update is None:
+            return base
+        if isinstance(base, torch.Tensor):
+            replaced = base.clone()
+            replaced[start:end] = update
+            return replaced
+        if isinstance(base, list):
+            replaced = list(base)
+            replaced[start:end] = update
+            return replaced
+        if isinstance(base, dict):
+            return {
+                key: EnvWorker._replace_nested_slice(base[key], update[key], start, end)
+                for key in base.keys()
+            }
+        return update
+
+    def _update_env_output_slice(
+        self, env_output: EnvOutput, update: EnvOutput, start: int, end: int
+    ) -> EnvOutput:
+        env_output.obs = self._replace_nested_slice(env_output.obs, update.obs, start, end)
+        if env_output.final_obs is not None and update.final_obs is not None:
+            env_output.final_obs = self._replace_nested_slice(
+                env_output.final_obs, update.final_obs, start, end
+            )
+        elif env_output.final_obs is None:
+            env_output.final_obs = None
+        if env_output.rewards is None and update.rewards is not None:
+            env_output.rewards = self._initialize_missing_tensor_field(
+                env_output, update.rewards
+            )
+        env_output.rewards = self._replace_nested_slice(
+            env_output.rewards, update.rewards, start, end
+        )
+        if env_output.dones is None and update.dones is not None:
+            env_output.dones = self._initialize_missing_tensor_field(env_output, update.dones)
+        env_output.dones = self._replace_nested_slice(env_output.dones, update.dones, start, end)
+        if env_output.terminations is None and update.terminations is not None:
+            env_output.terminations = self._initialize_missing_tensor_field(
+                env_output, update.terminations
+            )
+        env_output.terminations = self._replace_nested_slice(
+            env_output.terminations, update.terminations, start, end
+        )
+        if env_output.truncations is None and update.truncations is not None:
+            env_output.truncations = self._initialize_missing_tensor_field(
+                env_output, update.truncations
+            )
+        env_output.truncations = self._replace_nested_slice(
+            env_output.truncations, update.truncations, start, end
+        )
+        if env_output.intervene_actions is None and update.intervene_actions is not None:
+            env_output.intervene_actions = self._initialize_missing_tensor_field(
+                env_output, update.intervene_actions
+            )
+        env_output.intervene_actions = self._replace_nested_slice(
+            env_output.intervene_actions, update.intervene_actions, start, end
+        )
+        if env_output.intervene_flags is None and update.intervene_flags is not None:
+            env_output.intervene_flags = self._initialize_missing_tensor_field(
+                env_output, update.intervene_flags
+            )
+        env_output.intervene_flags = self._replace_nested_slice(
+            env_output.intervene_flags, update.intervene_flags, start, end
+        )
+        return env_output
+
+    @staticmethod
+    def _slice_rollout_result(
+        rollout_result: RolloutResult, start: int, end: int
+    ) -> RolloutResult:
+        return RolloutResult(
+            actions=rollout_result.actions[start:end]
+            if rollout_result.actions is not None
+            else None,
+            prev_logprobs=rollout_result.prev_logprobs[start:end]
+            if rollout_result.prev_logprobs is not None
+            else None,
+            prev_values=rollout_result.prev_values[start:end]
+            if rollout_result.prev_values is not None
+            else None,
+            bootstrap_values=rollout_result.bootstrap_values[start:end]
+            if rollout_result.bootstrap_values is not None
+            else None,
+            save_flags=rollout_result.save_flags[start:end]
+            if rollout_result.save_flags is not None
+            else None,
+            forward_inputs={
+                key: value[start:end].contiguous()
+                for key, value in rollout_result.forward_inputs.items()
+            },
+            versions=rollout_result.versions[start:end]
+            if rollout_result.versions is not None
+            else None,
+        )
+
+    @staticmethod
+    def _merge_chunk_step_result_shards(
+        shards: list[tuple[int, ChunkStepResult]]
+    ) -> ChunkStepResult:
+        shards = sorted(shards, key=lambda item: item[0])
+
+        def _merge_optional_tensor(field_name: str) -> torch.Tensor | None:
+            tensors = [
+                getattr(result, field_name)
+                for _, result in shards
+                if getattr(result, field_name) is not None
+            ]
+            if not tensors:
+                return None
+            return torch.cat(tensors, dim=0)
+
+        forward_inputs_list = [
+            result.forward_inputs for _, result in shards if result.forward_inputs
+        ]
+        merged_forward_inputs = {}
+        if forward_inputs_list:
+            for key in forward_inputs_list[0].keys():
+                merged_forward_inputs[key] = torch.cat(
+                    [forward_inputs[key] for forward_inputs in forward_inputs_list], dim=0
+                )
+
+        return ChunkStepResult(
+            actions=_merge_optional_tensor("actions"),
+            prev_logprobs=_merge_optional_tensor("prev_logprobs"),
+            prev_values=_merge_optional_tensor("prev_values"),
+            dones=_merge_optional_tensor("dones"),
+            truncations=_merge_optional_tensor("truncations"),
+            terminations=_merge_optional_tensor("terminations"),
+            rewards=_merge_optional_tensor("rewards"),
+            forward_inputs=merged_forward_inputs,
+            versions=_merge_optional_tensor("versions"),
+        )
+
+    @staticmethod
+    def _merge_save_flag_shards(
+        shards: list[tuple[int, int, torch.Tensor]]
+    ) -> torch.Tensor | None:
+        if not shards:
+            return None
+        return torch.cat(
+            [flag for _, _, flag in sorted(shards, key=lambda item: item[0])], dim=0
+        )
+
+    def _send_env_micro_batches(
+        self,
+        output_channel: Channel,
+        env_batch: dict[str, Any],
+        *,
+        mode: Literal["train", "eval"] = "train",
+        micro_batch_id: int | None = None,
+        local_offset: int = 0,
+    ) -> None:
+        if not self._vlm_ae_disagg_enabled or mode != "train":
+            self.send_env_batch(output_channel, env_batch, mode=mode)
+            return
+
+        micro_ids = (
+            [micro_batch_id]
+            if micro_batch_id is not None
+            else sorted(self._vlm_ae_env_to_vlm_micro_specs[mode].keys())
+        )
+        for mid in micro_ids:
+            for spec in self._vlm_ae_env_to_vlm_micro_specs[mode].get(mid, []):
+                env_batch_i = self._slice_env_batch(
+                    env_batch,
+                    spec.src_start - local_offset,
+                    spec.src_end - local_offset,
+                )
+                output_channel.put(
+                    item=env_batch_i,
+                    key=CommMapper.build_channel_key(
+                        self._rank,
+                        spec.peer_rank,
+                        extra=f"{mode}_obs_mb{mid}_ord{spec.order}",
+                    ),
+                )
+
+    def _recv_rollout_result_micro(
+        self,
+        input_channel: Channel,
+        *,
+        micro_batch_id: int,
+        mode: Literal["train", "eval"] = "train",
+    ) -> tuple[RolloutResult, MicroSliceSpec]:
+        specs = self._vlm_ae_from_ae_micro_specs[mode][micro_batch_id]
+        if len(specs) != 1:
+            raise ValueError(
+                f"Expected exactly one AE->env micro slice for env rank {self._rank}, got {specs=}"
+            )
+        spec = specs[0]
+        rollout_result = input_channel.get(
+            key=CommMapper.build_channel_key(
+                spec.peer_rank,
+                self._rank,
+                extra=f"{mode}_rollout_results_mb{micro_batch_id}_ord{spec.order}",
+            ),
+        )
+        return rollout_result, spec
+
+    def _get_local_micro_bounds(self, micro_batch_id: int) -> tuple[int, int]:
+        local_batch_size = self.train_num_envs_per_stage
+        micro_batch_size = local_batch_size // self._vlm_ae_num_micro_batches
+        start = micro_batch_id * micro_batch_size
+        end = start + micro_batch_size
+        return start, end
+
+    def _send_baseline_micro_batch(
+        self,
+        output_channel: Channel,
+        env_batch: dict[str, Any],
+        *,
+        micro_batch_id: int,
+        mode: Literal["train", "eval"] = "train",
+        already_sliced: bool = False,
+    ) -> None:
+        dst_rank, _ = self.dst_ranks[mode][0]
+        if already_sliced:
+            payload = env_batch
+        else:
+            start, end = self._get_local_micro_bounds(micro_batch_id)
+            payload = self._slice_env_batch(env_batch, start, end)
+        output_channel.put(
+            item=payload,
+            key=CommMapper.build_channel_key(
+                self._rank, dst_rank, extra=f"{mode}_obs_mb{micro_batch_id}"
+            ),
+        )
+
+    def _recv_baseline_rollout_result_micro(
+        self,
+        input_channel: Channel,
+        *,
+        micro_batch_id: int,
+        mode: Literal["train", "eval"] = "train",
+    ) -> RolloutResult:
+        src_rank, _ = self.src_ranks[mode][0]
+        return input_channel.get(
+            key=CommMapper.build_channel_key(
+                src_rank, self._rank, extra=f"{mode}_rollout_results_mb{micro_batch_id}"
+            ),
+        )
+
     def send_env_batch(
         self,
         output_channel: Channel,
@@ -575,7 +1015,28 @@ class EnvWorker(Worker):
             mode: Rollout mode, either ``"train"`` or ``"eval"``.
         """
         assert mode in ["train", "eval"], f"{mode=} is not supported"
-        dst_ranks_and_sizes = self.dst_ranks[mode]
+        self._send_env_batch_to_ranks(
+            output_channel,
+            env_batch,
+            self.dst_ranks[mode],
+            mode,
+        )
+        aux_dst_ranks = self._vlm_ae_aux_dst_ranks.get(mode)
+        if aux_dst_ranks:
+            self._send_env_batch_to_ranks(
+                output_channel,
+                env_batch,
+                aux_dst_ranks,
+                mode,
+            )
+
+    def _send_env_batch_to_ranks(
+        self,
+        output_channel: Channel,
+        env_batch: dict[str, Any],
+        dst_ranks_and_sizes: list[tuple[int, int]],
+        mode: Literal["train", "eval"] = "train",
+    ) -> None:
         split_sizes = [size for _, size in dst_ranks_and_sizes]
         env_batches = self.split_env_batch(env_batch, split_sizes, mode)
         for (rank, _), env_batch_i in zip(dst_ranks_and_sizes, env_batches):
@@ -663,6 +1124,401 @@ class EnvWorker(Worker):
         for trajectory in trajectories:
             channel.put(trajectory, async_op=True)
 
+    async def _run_interact_once_disagg(
+        self,
+        input_channel: Channel,
+        output_channel: Channel,
+        actor_channel: Channel | None,
+        *,
+        cooperative_yield: bool,
+    ) -> dict[str, torch.Tensor]:
+        self.rollout_results = [
+            EmbodiedRolloutResult(
+                max_episode_length=self.cfg.env.train.max_episode_steps,
+            )
+            for _ in range(self.stage_num)
+        ]
+        env_metrics = defaultdict(list)
+
+        for epoch in range(self.rollout_epoch):
+            env_outputs = self.bootstrap_step()
+            for stage_id in range(self.stage_num):
+                env_batch = env_outputs[stage_id].to_dict()
+                self._send_env_micro_batches(output_channel, env_batch, mode="train")
+
+            for chunk_step in range(self.n_train_chunk_steps):
+                for stage_id in range(self.stage_num):
+                    if cooperative_yield:
+                        await asyncio.sleep(0)
+
+                    env_output = env_outputs[stage_id]
+                    curr_obs = env_output.obs
+                    if env_output.intervene_actions is not None:
+                        self.rollout_results[stage_id].update_last_actions(
+                            env_output.intervene_actions,
+                            env_output.intervene_flags,
+                        )
+
+                    shard_results: list[tuple[int, ChunkStepResult]] = []
+                    save_flag_shards: list[tuple[int, int, torch.Tensor]] = []
+                    step_t0 = time.time()
+
+                    for micro_batch_id in range(self._vlm_ae_num_micro_batches):
+                        micro_t0 = time.time()
+                        rollout_result, spec = self._recv_rollout_result_micro(
+                            input_channel,
+                            micro_batch_id=micro_batch_id,
+                            mode="train",
+                        )
+                        shard_env_output = self._slice_env_output(
+                            env_output, spec.dst_start, spec.dst_end
+                        )
+                        rewards = self.compute_bootstrap_rewards(
+                            shard_env_output, rollout_result.bootstrap_values
+                        )
+                        shard_results.append(
+                            (
+                                spec.dst_start,
+                                ChunkStepResult(
+                                    actions=rollout_result.forward_inputs.get("action", None),
+                                    prev_logprobs=rollout_result.prev_logprobs
+                                    if self.collect_prev_infos
+                                    else None,
+                                    prev_values=rollout_result.prev_values
+                                    if self.collect_prev_infos
+                                    else None,
+                                    forward_inputs=rollout_result.forward_inputs,
+                                    versions=rollout_result.versions,
+                                    dones=shard_env_output.dones,
+                                    truncations=shard_env_output.truncations,
+                                    terminations=shard_env_output.terminations,
+                                    rewards=rewards,
+                                ),
+                            )
+                        )
+                        if rollout_result.save_flags is not None:
+                            save_flag_shards.append(
+                                (spec.dst_start, spec.dst_end, rollout_result.save_flags)
+                            )
+
+                        updated_shard_env_output, env_info = self.env_interact_micro_step(
+                            rollout_result.actions,
+                            stage_id,
+                            spec.dst_start,
+                            spec.dst_end,
+                        )
+                        self._update_env_output_slice(
+                            env_outputs[stage_id],
+                            updated_shard_env_output,
+                            spec.dst_start,
+                            spec.dst_end,
+                        )
+                        self._send_env_micro_batches(
+                            output_channel,
+                            updated_shard_env_output.to_dict(),
+                            mode="train",
+                            micro_batch_id=micro_batch_id,
+                            local_offset=spec.dst_start,
+                        )
+                        append_timeline_event(
+                            self.cfg,
+                            component="env_micro",
+                            rank=self._rank,
+                            tag=(
+                                f"env_micro_e{epoch}_cs{chunk_step}_st{stage_id}"
+                                f"_mb{micro_batch_id}"
+                            ),
+                            t0=micro_t0,
+                            t1=time.time(),
+                            global_step=getattr(self, "_global_step", None),
+                            extra={
+                                "chunk_step": chunk_step,
+                                "stage_idx": stage_id,
+                                "micro_batch_id": micro_batch_id,
+                            },
+                        )
+                        self.record_env_metrics(env_metrics, env_info, epoch)
+
+                    merged_chunk_result = self._merge_chunk_step_result_shards(shard_results)
+                    self.rollout_results[stage_id].append_step_result(merged_chunk_result)
+                    merged_save_flags = self._merge_save_flag_shards(save_flag_shards)
+                    if merged_save_flags is not None:
+                        self.rollout_results[stage_id].mark_last_step_with_flags(
+                            merged_save_flags
+                        )
+
+                    append_timeline_event(
+                        self.cfg,
+                        component="env",
+                        rank=self._rank,
+                        tag=f"env_chunk_e{epoch}_cs{chunk_step}_st{stage_id}",
+                        t0=step_t0,
+                        t1=time.time(),
+                        global_step=getattr(self, "_global_step", None),
+                    )
+                    if self.collect_transitions:
+                        self.rollout_results[stage_id].append_transitions(
+                            curr_obs, env_outputs[stage_id].obs
+                        )
+
+            for stage_id in range(self.stage_num):
+                env_output = env_outputs[stage_id]
+                if env_output.intervene_actions is not None:
+                    self.rollout_results[stage_id].update_last_actions(
+                        env_output.intervene_actions,
+                        env_output.intervene_flags,
+                    )
+
+                time0 = time.time()
+                shard_results: list[tuple[int, ChunkStepResult]] = []
+                for micro_batch_id in range(self._vlm_ae_num_micro_batches):
+                    rollout_result, spec = self._recv_rollout_result_micro(
+                        input_channel,
+                        micro_batch_id=micro_batch_id,
+                        mode="train",
+                    )
+                    shard_env_output = self._slice_env_output(
+                        env_output, spec.dst_start, spec.dst_end
+                    )
+                    rewards = self.compute_bootstrap_rewards(
+                        shard_env_output, rollout_result.bootstrap_values
+                    )
+                    shard_results.append(
+                        (
+                            spec.dst_start,
+                            ChunkStepResult(
+                                prev_values=rollout_result.prev_values
+                                if self.collect_prev_infos
+                                else None,
+                                dones=shard_env_output.dones,
+                                truncations=shard_env_output.truncations,
+                                terminations=shard_env_output.terminations,
+                                rewards=rewards,
+                            ),
+                        )
+                    )
+                self.rollout_results[stage_id].append_step_result(
+                    self._merge_chunk_step_result_shards(shard_results)
+                )
+                append_timeline_event(
+                    self.cfg,
+                    component="env",
+                    rank=self._rank,
+                    tag=f"recv_rollout_results_e{epoch}_st{stage_id}",
+                    t0=time0,
+                    t1=time.time(),
+                    global_step=getattr(self, "_global_step", None),
+                )
+
+            self.store_last_obs_and_intervened_info(env_outputs)
+            self.finish_rollout()
+
+        if actor_channel is not None:
+            for stage_id in range(self.stage_num):
+                await self.send_rollout_trajectories(
+                    self.rollout_results[stage_id], actor_channel
+                )
+
+        return env_metrics
+
+    async def _run_interact_once_baseline_micro(
+        self,
+        input_channel: Channel,
+        output_channel: Channel,
+        actor_channel: Channel | None,
+        *,
+        cooperative_yield: bool,
+    ) -> dict[str, torch.Tensor]:
+        self.rollout_results = [
+            EmbodiedRolloutResult(
+                max_episode_length=self.cfg.env.train.max_episode_steps,
+            )
+            for _ in range(self.stage_num)
+        ]
+        env_metrics = defaultdict(list)
+
+        for epoch in range(self.rollout_epoch):
+            env_outputs = self.bootstrap_step()
+            for stage_id in range(self.stage_num):
+                env_batch = env_outputs[stage_id].to_dict()
+                for micro_batch_id in range(self._vlm_ae_num_micro_batches):
+                    self._send_baseline_micro_batch(
+                        output_channel,
+                        env_batch,
+                        micro_batch_id=micro_batch_id,
+                        mode="train",
+                    )
+
+            for chunk_step in range(self.n_train_chunk_steps):
+                for stage_id in range(self.stage_num):
+                    if cooperative_yield:
+                        await asyncio.sleep(0)
+
+                    env_output = env_outputs[stage_id]
+                    curr_obs = env_output.obs
+                    if env_output.intervene_actions is not None:
+                        self.rollout_results[stage_id].update_last_actions(
+                            env_output.intervene_actions,
+                            env_output.intervene_flags,
+                        )
+
+                    shard_results: list[tuple[int, ChunkStepResult]] = []
+                    save_flag_shards: list[tuple[int, int, torch.Tensor]] = []
+                    step_t0 = time.time()
+
+                    for micro_batch_id in range(self._vlm_ae_num_micro_batches):
+                        start, end = self._get_local_micro_bounds(micro_batch_id)
+                        micro_t0 = time.time()
+                        rollout_result = self._recv_baseline_rollout_result_micro(
+                            input_channel,
+                            micro_batch_id=micro_batch_id,
+                            mode="train",
+                        )
+                        shard_env_output = self._slice_env_output(env_output, start, end)
+                        rewards = self.compute_bootstrap_rewards(
+                            shard_env_output, rollout_result.bootstrap_values
+                        )
+                        shard_results.append(
+                            (
+                                start,
+                                ChunkStepResult(
+                                    actions=rollout_result.forward_inputs.get("action", None),
+                                    prev_logprobs=rollout_result.prev_logprobs
+                                    if self.collect_prev_infos
+                                    else None,
+                                    prev_values=rollout_result.prev_values
+                                    if self.collect_prev_infos
+                                    else None,
+                                    forward_inputs=rollout_result.forward_inputs,
+                                    versions=rollout_result.versions,
+                                    dones=shard_env_output.dones,
+                                    truncations=shard_env_output.truncations,
+                                    terminations=shard_env_output.terminations,
+                                    rewards=rewards,
+                                ),
+                            )
+                        )
+                        if rollout_result.save_flags is not None:
+                            save_flag_shards.append((start, end, rollout_result.save_flags))
+
+                        updated_shard_env_output, env_info = self.env_interact_micro_step(
+                            rollout_result.actions,
+                            stage_id,
+                            start,
+                            end,
+                        )
+                        self._update_env_output_slice(
+                            env_outputs[stage_id],
+                            updated_shard_env_output,
+                            start,
+                            end,
+                        )
+                        self._send_baseline_micro_batch(
+                            output_channel,
+                            updated_shard_env_output.to_dict(),
+                            micro_batch_id=micro_batch_id,
+                            mode="train",
+                            already_sliced=True,
+                        )
+                        append_timeline_event(
+                            self.cfg,
+                            component="env_micro",
+                            rank=self._rank,
+                            tag=(
+                                f"env_micro_e{epoch}_cs{chunk_step}_st{stage_id}"
+                                f"_mb{micro_batch_id}"
+                            ),
+                            t0=micro_t0,
+                            t1=time.time(),
+                            global_step=getattr(self, "_global_step", None),
+                            extra={
+                                "chunk_step": chunk_step,
+                                "stage_idx": stage_id,
+                                "micro_batch_id": micro_batch_id,
+                            },
+                        )
+                        self.record_env_metrics(env_metrics, env_info, epoch)
+
+                    merged_chunk_result = self._merge_chunk_step_result_shards(shard_results)
+                    self.rollout_results[stage_id].append_step_result(merged_chunk_result)
+                    merged_save_flags = self._merge_save_flag_shards(save_flag_shards)
+                    if merged_save_flags is not None:
+                        self.rollout_results[stage_id].mark_last_step_with_flags(
+                            merged_save_flags
+                        )
+                    append_timeline_event(
+                        self.cfg,
+                        component="env",
+                        rank=self._rank,
+                        tag=f"env_chunk_e{epoch}_cs{chunk_step}_st{stage_id}",
+                        t0=step_t0,
+                        t1=time.time(),
+                        global_step=getattr(self, "_global_step", None),
+                    )
+                    if self.collect_transitions:
+                        self.rollout_results[stage_id].append_transitions(
+                            curr_obs, env_outputs[stage_id].obs
+                        )
+
+            for stage_id in range(self.stage_num):
+                env_output = env_outputs[stage_id]
+                if env_output.intervene_actions is not None:
+                    self.rollout_results[stage_id].update_last_actions(
+                        env_output.intervene_actions,
+                        env_output.intervene_flags,
+                    )
+
+                time0 = time.time()
+                shard_results: list[tuple[int, ChunkStepResult]] = []
+                for micro_batch_id in range(self._vlm_ae_num_micro_batches):
+                    start, end = self._get_local_micro_bounds(micro_batch_id)
+                    rollout_result = self._recv_baseline_rollout_result_micro(
+                        input_channel,
+                        micro_batch_id=micro_batch_id,
+                        mode="train",
+                    )
+                    shard_env_output = self._slice_env_output(env_output, start, end)
+                    rewards = self.compute_bootstrap_rewards(
+                        shard_env_output, rollout_result.bootstrap_values
+                    )
+                    shard_results.append(
+                        (
+                            start,
+                            ChunkStepResult(
+                                prev_values=rollout_result.prev_values
+                                if self.collect_prev_infos
+                                else None,
+                                dones=shard_env_output.dones,
+                                truncations=shard_env_output.truncations,
+                                terminations=shard_env_output.terminations,
+                                rewards=rewards,
+                            ),
+                        )
+                    )
+                self.rollout_results[stage_id].append_step_result(
+                    self._merge_chunk_step_result_shards(shard_results)
+                )
+                append_timeline_event(
+                    self.cfg,
+                    component="env",
+                    rank=self._rank,
+                    tag=f"recv_rollout_results_e{epoch}_st{stage_id}",
+                    t0=time0,
+                    t1=time.time(),
+                    global_step=getattr(self, "_global_step", None),
+                )
+
+            self.store_last_obs_and_intervened_info(env_outputs)
+            self.finish_rollout()
+
+        if actor_channel is not None:
+            for stage_id in range(self.stage_num):
+                await self.send_rollout_trajectories(
+                    self.rollout_results[stage_id], actor_channel
+                )
+
+        return env_metrics
+
     async def _run_interact_once(
         self,
         input_channel: Channel,
@@ -671,6 +1527,21 @@ class EnvWorker(Worker):
         *,
         cooperative_yield: bool,
     ) -> dict[str, torch.Tensor]:
+        if self._vlm_ae_disagg_enabled:
+            return await self._run_interact_once_disagg(
+                input_channel,
+                output_channel,
+                actor_channel,
+                cooperative_yield=cooperative_yield,
+            )
+        if self._baseline_micro_pipeline_enabled:
+            return await self._run_interact_once_baseline_micro(
+                input_channel,
+                output_channel,
+                actor_channel,
+                cooperative_yield=cooperative_yield,
+            )
+
         self.rollout_results: list[EmbodiedRolloutResult] = [
             EmbodiedRolloutResult(
                 max_episode_length=self.cfg.env.train.max_episode_steps,

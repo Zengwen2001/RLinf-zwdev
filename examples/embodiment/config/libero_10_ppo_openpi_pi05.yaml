@@ -35,6 +35,9 @@ runner:
   resume_dir: null # Optional: path to a saved checkpoint directory, such as 'checkpoints/global_step_10'. If not None, it will be used to resume training.
   ckpt_path: null  # Optional: path to a .pt checkpoint. If not None, it will be loaded after the model is instantiated (for evaluation).
 
+  timeline_trace: true
+  timeline_dir: ${runner.logger.log_path}/timeline 
+
 algorithm:
 
   normalize_advantages: True
@@ -86,7 +89,7 @@ env:
   group_name: "EnvGroup"
 
   train:
-    total_num_envs: 64
+    total_num_envs: 32
     max_episode_steps: 480 # max episode steps for truncation
     max_steps_per_rollout_epoch: 480
     reward_coef: ${algorithm.reward_coef}
@@ -116,7 +119,7 @@ rollout:
   # torch_compile_mode: "max-autotune"
 
   model:
-    model_path: "/path/to/model/RLinf-Pi05-SFT" # https://huggingface.co/RLinf/RLinf-Pi05-SFT
+    model_path: "/mnt/public/zengwen/RLinf-Pi05-LIBERO-SFT" # https://huggingface.co/RLinf/RLinf-Pi05-SFT
     precision: ${actor.model.precision}
 
 actor:
@@ -129,7 +132,7 @@ actor:
 
   # Override the default values in model/pi0_5
   model:
-    model_path: "/path/to/model/RLinf-Pi05-SFT" # https://huggingface.co/RLinf/RLinf-Pi05-SFT
+    model_path: "/mnt/public/zengwen/RLinf-Pi05-LIBERO-SFT" # https://huggingface.co/RLinf/RLinf-Pi05-SFT
     model_type: "openpi"
     add_value_head: True
     # openpi specific parameters

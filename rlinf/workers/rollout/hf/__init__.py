@@ -11,3 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# Import VLM-AE pipeline worker to apply patches if enabled
+import os
+if os.environ.get("VLM_AE_DISAGG", "0") == "1" or os.environ.get(
+    "VLM_AE_BASELINE_MICROPIPE", "0"
+) == "1":
+    from rlinf.workers.rollout.hf.vlm_ae_pipeline_worker import patch_huggingface_worker_for_pipeline
+    patch_huggingface_worker_for_pipeline()

@@ -19,8 +19,34 @@ from glob import glob
 # Default palette for known components; others cycle from tab10
 _COMPONENT_COLORS: dict[str, str] = {
     "env": "#27ae60",
+    "env_micro": "#58d68d",
     "rollout": "#2980b9",
+    "rollout_preprocess": "#85c1e9",
+    "rollout_vlm": "#2471a3",
+    "rollout_ae": "#8e44ad",
+    "rollout_ae_detail": "#bb8fce",
+    "rollout_postprocess": "#d2b4de",
+    "kv_transfer": "#16a085",
+    "kv_wait": "#16a085",
+    "kv_queue": "#76d7c4",
+    "kv_unpack": "#48c9b0",
     "actor": "#d35400",
+}
+
+_COMPONENT_ORDER: dict[str, int] = {
+    "env": 0,
+    "env_micro": 1,
+    "rollout": 2,
+    "rollout_preprocess": 3,
+    "rollout_vlm": 4,
+    "kv_transfer": 5,
+    "kv_wait": 5,
+    "kv_queue": 6,
+    "kv_unpack": 7,
+    "rollout_ae_detail": 8,
+    "rollout_ae": 9,
+    "rollout_postprocess": 10,
+    "actor": 11,
 }
 
 
@@ -44,6 +70,16 @@ def _load_events(timeline_dir: str) -> list[dict]:
 
 def _lane_key(rec: dict) -> tuple[str, int]:
     return str(rec["component"]), int(rec["rank"])
+
+
+def _component_sort_key(component: str) -> tuple[int, str]:
+    return (_COMPONENT_ORDER.get(component, 999), component)
+
+
+def _lane_sort_key(lane: tuple[str, int]) -> tuple[int, str, int]:
+    component, rank = lane
+    order, name = _component_sort_key(component)
+    return (order, name, rank)
 
 
 def plot_timeline(
@@ -85,11 +121,11 @@ def plot_timeline_png(
     t_min = min(e["t0"] for e in events)
     t_max = max(e["t1"] for e in events)
 
-    lanes = sorted({_lane_key(e) for e in events})
+    lanes = sorted({_lane_key(e) for e in events}, key=_lane_sort_key)
     lane_index = {lk: i for i, lk in enumerate(lanes)}
 
     # Color by component name
-    components = sorted({lk[0] for lk in lanes})
+    components = sorted({lk[0] for lk in lanes}, key=_component_sort_key)
     tab = plt.get_cmap("tab10")
     comp_color: dict[str, str] = dict(_COMPONENT_COLORS)
     for i, c in enumerate(components):
@@ -176,12 +212,12 @@ def plot_timeline_html(
     t_min = min(e["t0"] for e in events)
     t_max = max(e["t1"] for e in events)
 
-    lanes = sorted({_lane_key(e) for e in events})
+    lanes = sorted({_lane_key(e) for e in events}, key=_lane_sort_key)
     lane_labels = [f"{c}/r{r}" for c, r in lanes]
     lane_label_by_key = {lk: f"{lk[0]}/r{lk[1]}" for lk in lanes}
 
     # Color by component
-    components = sorted({lk[0] for lk in lanes})
+    components = sorted({lk[0] for lk in lanes}, key=_component_sort_key)
     comp_color: dict[str, str] = dict(_COMPONENT_COLORS)
     # Plotly's default qualitative palette
     plotly_palette = [

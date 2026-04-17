@@ -13,14 +13,25 @@
 # limitations under the License.
 
 import math
+import os
+import time
 import random
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 import jax
 import numpy as np
 import torch
+from transformers.cache_utils import Cache, DynamicCache
+
+# Profiler configuration via environment variables
+MODEL_ENABLE_PROFILER = os.environ.get("MODEL_ENABLE_PROFILER", "0") == "1"
+MODEL_PROFILER_OUTPUT_DIR = os.environ.get("MODEL_PROFILER_OUTPUT_DIR", "./profiler_logs")
+MODEL_PROFILER_WARMUP_STEPS = int(os.environ.get("MODEL_PROFILER_WARMUP_STEPS", "50"))
+MODEL_PROFILER_NUM_STEPS = int(os.environ.get("MODEL_PROFILER_NUM_STEPS", "3"))
+MODEL_PROFILER_USE_CUDA = os.environ.get("MODEL_PROFILER_USE_CUDA", "1") == "1"
+MODEL_PROFILER_RANK = int(os.environ.get("MODEL_PROFILER_RANK", "0"))  # -1 means all ranks
 from openpi import transforms as _transforms
 from openpi.models import model as _model
 from openpi.models.pi0_config import Pi0Config
@@ -234,8 +245,56 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
         self.torch_compile_enabled = False
 
+        # Profiler state
+        self._profiler_step_count = 0
+        self._profiler_rank = 0  # Will be set by worker
+
+        # ===== VLM-AE Disaggregation Patch =====
+        # This is an optional feature that can be enabled via environment variable
+        self._vlm_ae_disagg_enabled = False
+        self._vlm_ae_role = None  # 'vlm', 'ae', or None
+        self._vlm_ae_kv_manager = None
+        self._vlm_ae_coordinator = None
+        self._last_ae_stage_timing = None
+        self._enable_baseline_timeline = False
+        self._last_baseline_timing = None
+
     def set_global_step(self, global_step):
         self.global_step = global_step
+
+    def setup_vlm_ae_disagg(self, batch_size: int = 24):
+        """
+        Setup VLM-AE disaggregation mode.
+
+        This method must be called after model is loaded and before inference.
+        It determines the worker role based on GPU assignment.
+
+        Args:
+            batch_size: Total batch size for the pipeline
+        """
+        from rlinf.models.embodiment.openpi.vlm_ae_disagg import (
+            is_disagg_enabled,
+            get_worker_role,
+            get_kv_manager,
+            get_coordinator,
+            WorkerRole,
+        )
+
+        if not is_disagg_enabled():
+            self._vlm_ae_disagg_enabled = False
+            return
+
+        self._vlm_ae_disagg_enabled = True
+        self._vlm_ae_role = get_worker_role()
+        self._vlm_ae_kv_manager = get_kv_manager()
+        self._vlm_ae_coordinator = get_coordinator(batch_size=batch_size)
+
+        if self._vlm_ae_role == WorkerRole.VLM:
+            print(f"[VLM-AE Disagg] Worker role: VLM on GPU {torch.cuda.current_device()}")
+        elif self._vlm_ae_role == WorkerRole.AE:
+            print(f"[VLM-AE Disagg] Worker role: AE on GPU {torch.cuda.current_device()}")
+        else:
+            print(f"[VLM-AE Disagg] Worker role: UNIFIED on GPU {torch.cuda.current_device()}")
 
     def setup_wrappers(
         self,
@@ -482,6 +541,316 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                     ).contiguous()
         return processed_obs
 
+    def _should_profile(self) -> bool:
+        """Check if profiler should be active for this step."""
+        if not MODEL_ENABLE_PROFILER:
+            return False
+
+        # Check rank filter (-1 means all ranks)
+        current_rank = getattr(self, '_profiler_rank', 0)
+        if MODEL_PROFILER_RANK >= 0 and current_rank != MODEL_PROFILER_RANK:
+            return False
+
+        # Still in warmup phase
+        if self._profiler_step_count < MODEL_PROFILER_WARMUP_STEPS:
+            return False
+        # Already profiled enough steps
+        profiled_steps = self._profiler_step_count - MODEL_PROFILER_WARMUP_STEPS
+        if profiled_steps >= MODEL_PROFILER_NUM_STEPS:
+            return False
+        return True
+
+    def _setup_profiler(self):
+        """Setup profiler for this step if needed."""
+        if not self._should_profile():
+            return None
+
+        profiled_steps = self._profiler_step_count - MODEL_PROFILER_WARMUP_STEPS
+        os.makedirs(MODEL_PROFILER_OUTPUT_DIR, exist_ok=True)
+        current_rank = getattr(self, '_profiler_rank', 0)
+        trace_file = os.path.join(
+            MODEL_PROFILER_OUTPUT_DIR, f"model_rank{current_rank}_step{profiled_steps}.json"
+        )
+
+        if MODEL_PROFILER_USE_CUDA:
+            activities = [
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ]
+        else:
+            activities = [torch.profiler.ProfilerActivity.CPU]
+
+        return trace_file, torch.profiler.profile(
+            activities=activities,
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        )
+
+    def _log_profiler_done(self):
+        """Log when profiler finishes profiling."""
+        profiled_steps = self._profiler_step_count - MODEL_PROFILER_WARMUP_STEPS + 1
+        if profiled_steps >= MODEL_PROFILER_NUM_STEPS:
+            import logging
+            logging.info(f"[ModelProfiler] Finished profiling {MODEL_PROFILER_NUM_STEPS} steps. "
+                        f"Results saved to {MODEL_PROFILER_OUTPUT_DIR}")
+
+    # ===== VLM-AE Disaggregation Methods =====
+    @torch.no_grad()
+    def _predict_vlm_stage(
+        self,
+        env_obs: dict,
+    ) -> dict:
+        """
+        VLM stage for disaggregated inference.
+
+        Computes VLM forward pass and returns KV cache for transfer.
+        Only called when _vlm_ae_role == 'vlm'.
+        """
+        # Process observations same as predict_action_batch
+        to_process_obs = self.obs_processor(env_obs)
+        processed_obs = self.input_transform(to_process_obs, transpose=False)
+        processed_obs = self.precision_processor(processed_obs)
+        observation = _model.Observation.from_dict(processed_obs)
+
+        # Preprocess observation
+        images, img_masks, lang_tokens, lang_masks, state = (
+            self._preprocess_observation(observation, train=False)
+        )
+
+        # Embed prefix
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks
+        )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+
+        # Compute KV cache
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"
+
+        (prefix_output, _), past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+        )
+
+        vlm_value = None
+        if self.use_vlm_value and prefix_output is not None:
+            vlm_value = self.get_value_from_vlm(prefix_output)
+
+        # Return data for transfer
+        return {
+            "kv_cache": past_key_values,
+            "prefix_output": prefix_output,
+            "prefix_pad_masks": prefix_pad_masks,
+            "state": state,
+            "vlm_value": vlm_value,
+        }
+
+    @torch.no_grad()
+    def _predict_ae_stage(
+        self,
+        kv_data: dict,
+        env_obs: Optional[dict] = None,
+        noise: Optional[torch.Tensor] = None,
+        mode: str = "train",
+        compute_values: bool = True,
+    ) -> tuple[torch.Tensor, dict]:
+        """
+        AE stage for disaggregated inference.
+
+        Runs denoise loop using transferred KV cache.
+        Only called when _vlm_ae_role == 'ae'.
+        """
+        stage_t0 = time.perf_counter()
+        phase_offsets = []
+
+        def record_phase(name: str, phase_start: float, phase_end: Optional[float] = None):
+            if phase_end is None:
+                phase_end = time.perf_counter()
+            phase_offsets.append(
+                (
+                    name,
+                    phase_start - stage_t0,
+                    phase_end - stage_t0,
+                )
+            )
+            return phase_end
+
+        if self.torch_compile_enabled and hasattr(torch, "compiler"):
+            mark_step_begin = getattr(torch.compiler, "cudagraph_mark_step_begin", None)
+            if callable(mark_step_begin):
+                mark_step_begin()
+
+        phase_start = time.perf_counter()
+        past_key_values = self._normalize_past_key_values_for_gemma(kv_data["kv_cache"])
+        record_phase("cache_normalize", phase_start)
+        prefix_output = kv_data.get("prefix_output")
+        prefix_pad_masks = kv_data["prefix_pad_masks"]
+        state = kv_data["state"]
+        values_vlm = kv_data.get("vlm_value")
+
+        bsize = state.shape[0]
+        device = state.device
+        num_steps = self.config.num_steps
+
+        # Generate noise if not provided
+        if noise is None:
+            actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
+            noise = self.sample_noise(actions_shape, device)
+
+        x_t = noise
+        chains = [x_t]
+        log_probs = []
+        values = []
+
+        if self.use_vlm_value and values_vlm is not None:
+            phase_start = time.perf_counter()
+            values_vlm = values_vlm.to(device=device)
+            record_phase("vlm_value_reuse", phase_start)
+        elif self.use_vlm_value and prefix_output is not None:
+            phase_start = time.perf_counter()
+            values_vlm = self.get_value_from_vlm(prefix_output)
+            record_phase("vlm_value", phase_start)
+
+        if self.config.joint_logprob:
+            phase_start = time.perf_counter()
+            initial_log_prob = self.get_logprob_norm(
+                x_t, torch.zeros_like(noise), torch.ones_like(noise)
+            )
+            log_probs.append(initial_log_prob)
+            record_phase("joint_logprob_init", phase_start)
+
+        phase_start = time.perf_counter()
+        if mode == "train":
+            if self.config.joint_logprob:
+                denoise_inds = torch.arange(num_steps, device=device)
+            else:
+                max_idx = num_steps - 2 if self.config.ignore_last else num_steps - 1
+                denoise_inds = torch.full(
+                    (num_steps,),
+                    random.randint(0, max_idx),
+                    device=device,
+                    dtype=torch.long,
+                )
+        else:
+            denoise_inds = torch.full(
+                (num_steps,), -1, device=device, dtype=torch.long
+            )
+        denoise_inds = denoise_inds[None].repeat(bsize, 1)
+        record_phase("denoise_setup", phase_start)
+
+        # Denoise loop
+        for idx in range(num_steps):
+            step_start = time.perf_counter()
+            sample_mode = "train" if idx == denoise_inds[0][idx].item() else "eval"
+            x_t_mean, x_t_std, value_t = self.sample_mean_var_val(
+                x_t, idx, state, prefix_pad_masks, past_key_values,
+                sample_mode, num_steps, compute_values,
+            )
+            x_t = x_t_mean + self.sample_noise(x_t.shape, device) * x_t_std
+            log_prob = self.get_logprob_norm(x_t, x_t_mean, x_t_std)
+            values.append(value_t)
+            chains.append(x_t)
+            log_probs.append(log_prob)
+            record_phase(f"denoise_step_{idx}", step_start)
+
+        phase_start = time.perf_counter()
+        x_0 = x_t
+        chains = torch.stack(chains, dim=1)
+        log_probs = torch.stack(log_probs, dim=1)[
+            :, :, : self.config.action_chunk, : self.config.action_env_dim
+        ]
+        if self.config.joint_logprob:
+            log_probs = log_probs.mean(dim=1)
+        else:
+            log_probs = log_probs[
+                torch.arange(log_probs.shape[0], device=device),
+                denoise_inds[:, 0],
+            ]
+
+        if self.use_vlm_value and prefix_output is not None:
+            prev_values = values_vlm[:, None]
+        else:
+            prev_values = torch.stack(values, dim=1).mean(dim=-1, keepdim=True)
+
+        actions = self.output_transform(
+            {"actions": x_0, "state": state}
+        )["actions"]
+        record_phase("postprocess", phase_start)
+
+        phase_start = time.perf_counter()
+        forward_inputs = self._build_rollout_forward_inputs(
+            env_obs=env_obs,
+            action=actions,
+            model_action=x_0,
+            chains=chains,
+            denoise_inds=denoise_inds,
+        )
+        record_phase("forward_inputs", phase_start)
+
+        result = {
+            "prev_logprobs": log_probs,
+            "prev_values": prev_values,
+            "forward_inputs": forward_inputs,
+        }
+
+        self._last_ae_stage_timing = {
+            "phases": phase_offsets,
+            "total": time.perf_counter() - stage_t0,
+        }
+
+        return actions, result
+
+    def _normalize_past_key_values_for_gemma(self, past_key_values):
+        """Convert transferred legacy KV cache into the cache object expected by Gemma."""
+        if past_key_values is None or isinstance(past_key_values, Cache):
+            return past_key_values
+
+        # Cross-rank transfer materializes KV cache as a legacy list/tuple of (k, v) pairs.
+        # Under torch.compile, Gemma expects a Cache object with get_seq_length().
+        if isinstance(past_key_values, (list, tuple)):
+            return DynamicCache.from_legacy_cache(tuple(past_key_values))
+
+        return past_key_values
+
+    def _build_rollout_forward_inputs(
+        self,
+        env_obs: Optional[dict],
+        action: torch.Tensor,
+        model_action: torch.Tensor,
+        chains: torch.Tensor,
+        denoise_inds: torch.Tensor,
+        forward_action: Optional[torch.Tensor] = None,
+    ) -> dict[str, torch.Tensor]:
+        """Build rollout forward inputs with the same schema as the standard path."""
+        forward_inputs = {
+            "chains": chains,
+            "denoise_inds": denoise_inds,
+            "action": action.reshape(action.shape[0], -1).contiguous(),
+            "model_action": model_action.reshape(model_action.shape[0], -1).contiguous(),
+        }
+        if forward_action is not None:
+            forward_inputs["action"] = forward_action
+
+        if env_obs is None:
+            return forward_inputs
+
+        to_process_obs = self.obs_processor(env_obs)
+        processed_obs = self.input_transform(to_process_obs, transpose=False)
+        processed_obs = self.precision_processor(processed_obs)
+        forward_inputs["tokenized_prompt"] = processed_obs["tokenized_prompt"]
+        forward_inputs["tokenized_prompt_mask"] = processed_obs["tokenized_prompt_mask"]
+
+        cloned_obs = copy_dict_tensor(
+            {k: v for k, v in to_process_obs.items() if k != "prompt"}
+        )
+        forward_inputs.update(cloned_obs)
+        return forward_inputs
+
     def predict_action_batch(
         self,
         env_obs,
@@ -489,6 +858,16 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         compute_values=True,
         **kwargs,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
+        timeline_enabled = getattr(self, "_enable_baseline_timeline", False)
+        baseline_timing = None
+        if timeline_enabled:
+            baseline_timing = {
+                "mode": mode,
+                "phases": [],
+            }
+            self._last_baseline_timing = baseline_timing
+            phase_start = time.time()
+
         to_process_obs = self.obs_processor(env_obs)  # env obs -> policy input obs
         processed_obs = self.input_transform(
             to_process_obs, transpose=False
@@ -497,30 +876,90 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             processed_obs
         )  # obs precision processor
         observation = _model.Observation.from_dict(processed_obs)
+        if timeline_enabled:
+            baseline_timing["batch_size"] = int(observation.state.shape[0])
+            baseline_timing["phases"].append(
+                ("baseline_preprocess", phase_start, time.time())
+            )
 
+        # ===== VLM-AE Disaggregation Branch =====
+        # This branch handles separated VLM/AE inference
+        # NOTE: Current implementation runs full inference on VLM workers and
+        # transfers KV to AE worker. AE worker can use transferred KV to skip
+        # VLM computation. This enables overlap between VLM(N+1) and AE(N).
+        if self._vlm_ae_disagg_enabled:
+            from rlinf.models.embodiment.openpi.vlm_ae_disagg import WorkerRole
+
+            if self._vlm_ae_role == WorkerRole.VLM:
+                # VLM worker: compute KV cache, transfer to AE, but also run full inference
+                # This ensures valid rollout results while enabling KV transfer
+                print(f"[VLM-AE DEBUG] VLM worker computing KV cache on GPU {torch.cuda.current_device()}")
+
+                # Compute KV cache and transfer
+                kv_data = self._predict_vlm_stage(env_obs)
+                self._vlm_ae_kv_manager.store_for_transfer(
+                    type('KVTransferData', (), kv_data)()
+                )
+
+                # Continue with standard inference (will use cached KV)
+                # Fall through to standard inference below
+
+            elif self._vlm_ae_role == WorkerRole.AE:
+                # AE worker: check for transferred KV, otherwise compute fresh
+                kv_data = getattr(self, '_pending_kv_data', None)
+                if kv_data is not None:
+                    print(f"[VLM-AE DEBUG] AE worker using transferred KV on GPU {torch.cuda.current_device()}")
+                    return self._predict_ae_stage(
+                        kv_data,
+                        env_obs=env_obs,
+                        mode=mode,
+                        compute_values=compute_values,
+                    )
+                else:
+                    print(f"[VLM-AE DEBUG] AE worker computing fresh (no KV transferred yet)")
+                    # Fall through to standard inference
+
+        # ===== Standard Inference (Non-disaggregated or fallback) =====
         is_dsrl_active = self.config.use_dsrl
+
+        # Setup profiler for inference
+        profiler_result = self._setup_profiler()
+        trace_file = None
+        profiler = None
+        if profiler_result is not None:
+            trace_file, profiler = profiler_result
+
         if is_dsrl_active:
             # DSRL mode (both train and eval)
+            def _dsrl_inference():
+                # Step 1: SAC agent outputs noise
+                dsrl_obs = {"images": [env_obs["main_images"]], "states": env_obs["states"]}
+                noise_actions, noise_logprob, _ = self.sac_forward(
+                    dsrl_obs, train=False, mode=mode
+                )
 
-            # Step 1: SAC agent outputs noise
-            dsrl_obs = {"images": [env_obs["main_images"]], "states": env_obs["states"]}
+                # Step 2: Use noise to sample actual actions from diffusion model
+                outputs = self.sample_actions(
+                    observation,
+                    noise=noise_actions,
+                    mode="eval",
+                    compute_values=compute_values,
+                )
 
-            noise_actions, noise_logprob, _ = self.sac_forward(
-                dsrl_obs, train=False, mode=mode
-            )
+                # Step 3: Extract actual actions for environment interaction
+                real_actions = self.output_transform(
+                    {"actions": outputs["actions"], "state": observation.state}
+                )["actions"]
 
-            # Step 2: Use noise to sample actual actions from diffusion model
-            outputs = self.sample_actions(
-                observation,
-                noise=noise_actions,
-                mode="eval",
-                compute_values=compute_values,
-            )
+                return noise_actions, noise_logprob, outputs, real_actions
 
-            # Step 3: Extract actual actions for environment interaction
-            real_actions = self.output_transform(
-                {"actions": outputs["actions"], "state": observation.state}
-            )["actions"]
+            if profiler is not None:
+                with profiler:
+                    noise_actions, noise_logprob, outputs, real_actions = _dsrl_inference()
+                profiler.export_chrome_trace(trace_file)
+                self._log_profiler_done()
+            else:
+                noise_actions, noise_logprob, outputs, real_actions = _dsrl_inference()
 
             # Return actual actions to environment, but forward_inputs stores noise.
             actions = real_actions
@@ -530,37 +969,47 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
         else:
             # Non-DSRL or eval mode
-            outputs = self.sample_actions(
-                observation, mode=mode, compute_values=compute_values
-            )
-            actions = self.output_transform(
-                {"actions": outputs["actions"], "state": observation.state}
-            )["actions"]
+            def _standard_inference():
+                outputs = self.sample_actions(
+                    observation, mode=mode, compute_values=compute_values
+                )
+                output_transform_start = time.time() if timeline_enabled else None
+                actions = self.output_transform(
+                    {"actions": outputs["actions"], "state": observation.state}
+                )["actions"]
+                if timeline_enabled:
+                    baseline_timing["phases"].append(
+                        ("baseline_output_transform", output_transform_start, time.time())
+                    )
+                return outputs, actions
+
+            if profiler is not None:
+                with profiler:
+                    outputs, actions = _standard_inference()
+                profiler.export_chrome_trace(trace_file)
+                self._log_profiler_done()
+            else:
+                outputs, actions = _standard_inference()
+
             prev_logprobs = outputs["prev_logprobs"]
             prev_values = outputs["prev_values"]
             forward_action = None
 
-        forward_inputs = {
-            "chains": outputs["chains"],
-            "denoise_inds": outputs["denoise_inds"],
-            "tokenized_prompt": processed_obs["tokenized_prompt"],
-            "tokenized_prompt_mask": processed_obs["tokenized_prompt_mask"],
-            # "action" is the env-executed action, and "model_action" is the original output by the model.
-            # For small models, they are consistent. For large models (like pi), "action" is the result after output_transform.
-            # For realworld human-in-the-loop training, only "action" can be provided by human.
-            "action": actions.reshape(actions.shape[0], -1).contiguous(),
-            "model_action": outputs["actions"]
-            .reshape(outputs["actions"].shape[0], -1)
-            .contiguous(),
-        }
-        if forward_action is not None:
-            forward_inputs["action"] = forward_action
+        self._profiler_step_count += 1
 
-        # Clone observations to avoid cross-step reference issues.
-        cloned_obs = copy_dict_tensor(
-            {k: v for k, v in to_process_obs.items() if k != "prompt"}
+        forward_inputs_start = time.time() if timeline_enabled else None
+        forward_inputs = self._build_rollout_forward_inputs(
+            env_obs=env_obs,
+            action=actions,
+            model_action=outputs["actions"],
+            chains=outputs["chains"],
+            denoise_inds=outputs["denoise_inds"],
+            forward_action=forward_action,
         )
-        forward_inputs.update(cloned_obs)
+        if timeline_enabled:
+            baseline_timing["phases"].append(
+                ("baseline_forward_inputs", forward_inputs_start, time.time())
+            )
 
         result = {
             "prev_logprobs": prev_logprobs,
@@ -587,6 +1036,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         else:
             # DSRL: SAC provides noise, convert dtype to match action_in_proj
             noise = noise.to(self.action_in_proj.weight.dtype)
+
+        timeline_enabled = getattr(self, "_enable_baseline_timeline", False)
+        baseline_timing = getattr(self, "_last_baseline_timing", None)
+        vlm_t0 = time.time() if timeline_enabled and baseline_timing is not None else None
 
         images, img_masks, lang_tokens, lang_masks, state = (
             self._preprocess_observation(observation, train=False)
@@ -620,6 +1073,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         # add value based on the vlm for pi05, expert for pi0
         if self.use_vlm_value:
             values_vlm = self.get_value_from_vlm(prefix_output)
+        if timeline_enabled and baseline_timing is not None:
+            baseline_timing["phases"].append(("baseline_vlm", vlm_t0, time.time()))
+            ae_t0 = time.time()
+        else:
+            ae_t0 = None
         if self.config.joint_logprob:
             initial_log_prob = self.get_logprob_norm(
                 x_t, torch.zeros_like(noise), torch.ones_like(noise)
@@ -687,6 +1145,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             values = values_vlm[:, None]
         else:
             values = torch.stack(values, dim=1).mean(dim=-1, keepdim=True)
+        if timeline_enabled and baseline_timing is not None:
+            baseline_timing["phases"].append(("baseline_ae", ae_t0, time.time()))
         return {
             "actions": x_0,
             "chains": chains,

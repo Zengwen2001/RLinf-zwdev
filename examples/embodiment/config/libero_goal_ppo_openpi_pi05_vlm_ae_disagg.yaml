@@ -1,0 +1,59 @@
+# VLM-AE Disaggregation Configuration Example
+#
+# This config demonstrates how to enable VLM-AE disaggregation for pipeline inference.
+# Usage:
+#   1. Set environment variables:
+#      export VLM_AE_DISAGG=1
+#      export VLM_AE_VLM_GPUS=0,1,2      # VLM workers on GPU 0,1,2
+#      export VLM_AE_AE_GPU=3             # AE worker on GPU 3
+#      export VLM_AE_NUM_MICRO_BATCHES=2  # Number of micro-batches
+#
+#   2. Run with this config:
+#      python run_embodiment.py libero_goal_ppo_openpi_pi05_vlm_ae_disagg
+#
+# Architecture:
+#   - GPU 0,1,2: VLM Workers (TP=3, compute-bound)
+#   - GPU 3: AE Worker (TP=1, memory-bound denoise loop)
+#   - Pipeline: 2 micro-batches of 12 envs each
+
+defaults:
+  - libero_goal_ppo_openpi_pi05
+
+# Override specific settings for disaggregated mode
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor: all
+    env: all
+    rollout: all
+
+# VLM-AE disaggregation settings
+# These are read from environment variables at runtime
+vlm_ae_disagg:
+  enabled: ${oc.env:VLM_AE_DISAGG,0} == "1"}
+  vlm_gpus: ${oc.env:VLM_AE_VLM_GPUS,"0,1,2"}
+  ae_gpu: ${oc.env:VLM_AE_AE_GPU,3}
+  num_micro_batches: ${oc.env:VLM_AE_NUM_MICRO_BATCHES,2}
+  transfer_backend: ${oc.env:VLM_AE_TRANSFER_BACKEND,nccl}  # nccl, rdma
+
+# For 48 envs with 2 micro-batches, each micro-batch has 24 envs
+# VLM workers process 24/3=8 envs each
+# AE worker processes all 24 envs
+env:
+  train:
+    total_num_envs: 48  # 2 micro-batches x 24 envs
+  eval:
+    total_num_envs: 24
+
+rollout:
+  # Enable torch compile for VLM workers
+  enable_torch_compile: True
+  torch_compile_mode: "max-autotune"
+
+  # Pipeline configuration
+  pipeline_stage_num: 1  # Single stage per worker
+
+# Performance tuning
+algorithm:
+  # Reduce rollout epoch for faster iteration during testing
+  rollout_epoch: 4
