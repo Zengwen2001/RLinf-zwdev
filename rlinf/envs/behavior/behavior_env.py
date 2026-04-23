@@ -648,5 +648,13 @@ class BehaviorEnv(gym.Env):
         # use for multi task training
         pass
 
+    def plan_next_bootstrap_reset(self):
+        return None
+
+    def reset_to_bootstrap_plan(self, plan):
+        if plan is not None:
+            raise ValueError("BehaviorEnv does not expect an explicit bootstrap plan.")
+        return self.reset()
+
     def close(self):
         self.env_close()

@@ -884,6 +884,21 @@ def validate_embodied_cfg(cfg):
         cfg.runner.overlap_env_bootstrap = bool(
             cfg.runner.get("overlap_env_bootstrap", False)
         ) and not cfg.env.train.get("enable_offload", False)
+        env_double_buffer_cfg = cfg.runner.get("env_double_buffer", None)
+        if env_double_buffer_cfg is None:
+            cfg.runner.env_double_buffer = OmegaConf.create(
+                {"enabled": False, "backend": "thread"}
+            )
+        else:
+            cfg.runner.env_double_buffer.enabled = bool(
+                env_double_buffer_cfg.get("enabled", False)
+            )
+            cfg.runner.env_double_buffer.backend = str(
+                env_double_buffer_cfg.get("backend", "thread")
+            ).lower()
+            assert cfg.runner.env_double_buffer.backend in {"thread", "process"}, (
+                "runner.env_double_buffer.backend must be either 'thread' or 'process'"
+            )
         if (
             SupportedEnvType(cfg.env.train.env_type) == SupportedEnvType.MANISKILL
             or SupportedEnvType(cfg.env.eval.env_type) == SupportedEnvType.MANISKILL
