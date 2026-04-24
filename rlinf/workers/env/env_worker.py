@@ -75,7 +75,6 @@ class EnvWorker(Worker):
         self.prepared_bootstrap: tuple[int, list[EnvOutput]] | None = None
         self.prepare_task: concurrent.futures.Future | None = None
         self._double_buffer_executor: concurrent.futures.ThreadPoolExecutor | None = None
-        self.reserved_next_run_bootstrap: tuple[int, list[EnvOutput]] | None = None
         self._double_buffer_warning_emitted = False
         self._double_buffer_prepare_total = 0
         self._double_buffer_prepare_hits = 0
@@ -442,7 +441,6 @@ class EnvWorker(Worker):
             self.prepare_task.cancel()
         self.prepare_task = None
         self.prepared_bootstrap = None
-        self.reserved_next_run_bootstrap = None
         self._prefetched_train_bootstrap = None
         self._prefetched_train_bootstrap_pool_idx = None
         if self._double_buffer_executor is not None:
@@ -636,17 +634,6 @@ class EnvWorker(Worker):
         self._double_buffer_fallback_count += 1
         self._set_active_train_pool_idx(self.active_pool_idx)
         return self._bootstrap_and_send_train(rollout_channel)
-
-    async def _reserve_next_run_bootstrap(self) -> None:
-        if self.prepare_task is None and self.prepared_bootstrap is None:
-            return
-        if not await self._ensure_prepared_bootstrap_ready():
-            self._double_buffer_prepare_total += 1
-            self._double_buffer_fallback_count += 1
-            env_outputs = self._bootstrap_step_for_envs(self.env_list)
-            self.reserved_next_run_bootstrap = (self.active_pool_idx, env_outputs)
-            return
-        self.reserved_next_run_bootstrap = self._pop_prepared_bootstrap()
 
     def _append_double_buffer_metrics(self, env_metrics: dict[str, list]) -> None:
         if not self.env_double_buffer_enabled:
@@ -1176,18 +1163,6 @@ class EnvWorker(Worker):
                 "A prefetched train bootstrap already exists. "
                 "Call interact() to consume it before prefetching again."
             )
-        if self.env_double_buffer_enabled:
-            if self.reserved_next_run_bootstrap is None:
-                self._double_buffer_prepare_total += 1
-                self._double_buffer_fallback_count += 1
-                env_outputs = self._bootstrap_step_for_envs(self.env_list)
-                self.reserved_next_run_bootstrap = (self.active_pool_idx, env_outputs)
-            pool_idx, env_outputs = self.reserved_next_run_bootstrap
-            self._prefetched_train_bootstrap = env_outputs
-            self._prefetched_train_bootstrap_pool_idx = pool_idx
-            self.reserved_next_run_bootstrap = None
-            self._send_train_bootstrap(rollout_channel, env_outputs)
-            return
         self._prefetched_train_bootstrap = self._bootstrap_and_send_train(
             rollout_channel
         )
@@ -1256,18 +1231,14 @@ class EnvWorker(Worker):
                     env_outputs = self._prefetched_train_bootstrap
                     self._prefetched_train_bootstrap = None
                     self._prefetched_train_bootstrap_pool_idx = None
-                elif epoch == 0 and self.reserved_next_run_bootstrap is not None:
-                    pool_idx, env_outputs = self.reserved_next_run_bootstrap
-                    self._set_active_train_pool_idx(pool_idx)
-                    self.reserved_next_run_bootstrap = None
-                    self._send_train_bootstrap(rollout_channel, env_outputs)
                 elif epoch == 0:
                     env_outputs = self._bootstrap_and_send_train(rollout_channel)
                 else:
                     env_outputs = await self._consume_double_buffer_bootstrap(
                         rollout_channel
                     )
-                self._schedule_next_bootstrap_prepare()
+                if epoch + 1 < self.rollout_epoch:
+                    self._schedule_next_bootstrap_prepare()
             elif epoch == 0 and self._prefetched_train_bootstrap is not None:
                 env_outputs = self._prefetched_train_bootstrap
                 self._prefetched_train_bootstrap = None
@@ -1393,9 +1364,6 @@ class EnvWorker(Worker):
 
             self.store_last_obs_and_intervened_info(env_outputs)
             self.finish_rollout()
-
-        if self.env_double_buffer_enabled:
-            await self._reserve_next_run_bootstrap()
 
         if actor_channel is not None:
             for stage_id in range(self.stage_num):
