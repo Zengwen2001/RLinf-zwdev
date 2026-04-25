@@ -74,7 +74,9 @@ class EnvWorker(Worker):
         self.active_pool_idx = 0
         self.prepared_bootstrap: tuple[int, list[EnvOutput]] | None = None
         self.prepare_task: concurrent.futures.Future | None = None
-        self._double_buffer_executor: concurrent.futures.ThreadPoolExecutor | None = None
+        self._double_buffer_executor: concurrent.futures.ThreadPoolExecutor | None = (
+            None
+        )
         self._double_buffer_warning_emitted = False
         self._double_buffer_prepare_total = 0
         self._double_buffer_prepare_hits = 0
@@ -543,7 +545,9 @@ class EnvWorker(Worker):
             dones=dones,
             terminations=dones.clone(),
             truncations=dones.clone(),
-            final_obs=infos["final_observation"] if "final_observation" in infos else None,
+            final_obs=infos["final_observation"]
+            if "final_observation" in infos
+            else None,
             intervene_actions=None,
             intervene_flags=None,
         )
@@ -567,7 +571,9 @@ class EnvWorker(Worker):
         if not self.env_double_buffer_enabled:
             return
         if self.prepare_task is not None:
-            raise RuntimeError("A double-buffer bootstrap prepare task is already active.")
+            raise RuntimeError(
+                "A double-buffer bootstrap prepare task is already active."
+            )
         if self._double_buffer_executor is None:
             raise RuntimeError("Env double buffer executor is not initialized.")
         source_pool_idx = self.active_pool_idx
@@ -644,7 +650,9 @@ class EnvWorker(Worker):
             torch.tensor([hit_ratio], dtype=torch.float32)
         )
         env_metrics["double_buffer_fallback_count"].append(
-            torch.tensor([float(self._double_buffer_fallback_count)], dtype=torch.float32)
+            torch.tensor(
+                [float(self._double_buffer_fallback_count)], dtype=torch.float32
+            )
         )
 
     @Worker.timer("env_interact_step")
