@@ -806,9 +806,13 @@ class CollectEpisode(gym.Wrapper):
     def plan_next_bootstrap_reset(self):
         if hasattr(self.env, "plan_next_bootstrap_reset"):
             return self.env.plan_next_bootstrap_reset()
-        raise AttributeError("Underlying env does not support bootstrap reset planning.")
+        raise AttributeError(
+            "Underlying env does not support bootstrap reset planning."
+        )
 
     def reset_to_bootstrap_plan(self, plan):
         if hasattr(self.env, "reset_to_bootstrap_plan"):
             return self.env.reset_to_bootstrap_plan(plan)
-        raise AttributeError("Underlying env does not support bootstrap reset planning.")
+        raise AttributeError(
+            "Underlying env does not support bootstrap reset planning."
+        )

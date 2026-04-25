@@ -394,7 +394,9 @@ class D4RLEnv(gym.Env):
             "planner_state": self._snapshot_bootstrap_planner_state(),
         }
 
-    def reset_to_bootstrap_plan(self, plan: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    def reset_to_bootstrap_plan(
+        self, plan: dict[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         planner_state = None if plan is None else plan.get("planner_state", None)
         if planner_state is not None:
             self._restore_bootstrap_planner_state(planner_state)
