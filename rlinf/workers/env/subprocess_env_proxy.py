@@ -154,9 +154,7 @@ class SubprocessEnvProxy:
         return self._rpc("call", {"name": "reset", "args": args, "kwargs": kwargs})
 
     def chunk_step(self, *args, **kwargs):
-        return self._rpc(
-            "call", {"name": "chunk_step", "args": args, "kwargs": kwargs}
-        )
+        return self._rpc("call", {"name": "chunk_step", "args": args, "kwargs": kwargs})
 
     def update_reset_state_ids(self):
         return self._rpc("call", {"name": "update_reset_state_ids"})
