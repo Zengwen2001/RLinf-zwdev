@@ -22,12 +22,19 @@ import gymnasium as gym
 import numpy as np
 import torch
 
+from rlinf.envs.bootstrap_planning import BootstrapResetPlannerMixin
 from rlinf.envs.calvin import CalvinBenchmark, make_env
 from rlinf.envs.calvin.venv import ReconfigureSubprocEnv
 from rlinf.envs.utils import list_of_dict_to_dict_of_list, to_tensor
 
 
-class CalvinEnv(gym.Env):
+class CalvinEnv(BootstrapResetPlannerMixin, gym.Env):
+    bootstrap_planner_array_fields = ("reset_state_ids", "reset_state_ids_all")
+    bootstrap_planner_generator_fields = (
+        ("generator_state", "_generator"),
+        ("generator_ordered_state", "_generator_ordered"),
+    )
+
     def __init__(self, cfg, num_envs, seed_offset, total_num_processes, worker_info):
         self.seed_offset = seed_offset
         self.cfg = cfg
@@ -224,48 +231,6 @@ class CalvinEnv(gym.Env):
     @is_start.setter
     def is_start(self, value):
         self._is_start = value
-
-    def _clone_reset_state_ids(self):
-        return np.array(self.reset_state_ids, copy=True)
-
-    def _snapshot_bootstrap_planner_state(self):
-        return {
-            "reset_state_ids": self._clone_reset_state_ids(),
-            "start_idx": int(self.start_idx),
-            "reset_state_ids_all": np.array(self.reset_state_ids_all, copy=True),
-            "generator_state": copy.deepcopy(self._generator.bit_generator.state),
-            "generator_ordered_state": copy.deepcopy(
-                self._generator_ordered.bit_generator.state
-            ),
-        }
-
-    def _restore_bootstrap_planner_state(self, state):
-        self.reset_state_ids = np.array(state["reset_state_ids"], copy=True)
-        self.start_idx = int(state["start_idx"])
-        self.reset_state_ids_all = np.array(state["reset_state_ids_all"], copy=True)
-        self._generator.bit_generator.state = copy.deepcopy(state["generator_state"])
-        self._generator_ordered.bit_generator.state = copy.deepcopy(
-            state["generator_ordered_state"]
-        )
-
-    def plan_next_bootstrap_reset(self):
-        if self.use_fixed_reset_state_ids and self.is_start:
-            plan_ids = self._clone_reset_state_ids()
-        else:
-            self.update_reset_state_ids()
-            plan_ids = self._clone_reset_state_ids()
-        return {
-            "reset_state_ids": plan_ids,
-            "planner_state": self._snapshot_bootstrap_planner_state(),
-        }
-
-    def reset_to_bootstrap_plan(self, plan):
-        planner_state = None if plan is None else plan.get("planner_state", None)
-        if planner_state is not None:
-            self._restore_bootstrap_planner_state(planner_state)
-        self.is_start = False
-        reset_state_ids = None if plan is None else plan.get("reset_state_ids", None)
-        return self.reset(reset_state_ids=reset_state_ids)
 
     def _init_metrics(self):
         self.success_once = np.zeros(self.num_envs, dtype=bool)

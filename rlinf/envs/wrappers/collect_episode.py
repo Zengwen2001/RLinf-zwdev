@@ -137,6 +137,7 @@ class CollectEpisode(gym.Wrapper):
         *,
         seed: Optional[int] = None,
         options: Optional[dict[str, Any]] = None,
+        **kwargs,
     ):
         """Reset the environment and initialise episode buffers.
 
@@ -153,7 +154,7 @@ class CollectEpisode(gym.Wrapper):
         self._pending_info = [None] * self.num_envs
 
         try:
-            obs, info = self.env.reset(seed=seed, options=options)
+            obs, info = self.env.reset(seed=seed, options=options, **kwargs)
         except TypeError:
             obs, info = self.env.reset()
 
@@ -802,17 +803,3 @@ class CollectEpisode(gym.Wrapper):
     def update_reset_state_ids(self):
         if hasattr(self.env, "update_reset_state_ids"):
             self.env.update_reset_state_ids()
-
-    def plan_next_bootstrap_reset(self):
-        if hasattr(self.env, "plan_next_bootstrap_reset"):
-            return self.env.plan_next_bootstrap_reset()
-        raise AttributeError(
-            "Underlying env does not support bootstrap reset planning."
-        )
-
-    def reset_to_bootstrap_plan(self, plan):
-        if hasattr(self.env, "reset_to_bootstrap_plan"):
-            return self.env.reset_to_bootstrap_plan(plan)
-        raise AttributeError(
-            "Underlying env does not support bootstrap reset planning."
-        )

@@ -21,6 +21,7 @@ import gym
 import numpy as np
 import torch
 
+from rlinf.envs.bootstrap_planning import BootstrapResetPlannerMixin
 from rlinf.envs.venv.venv import DummyVectorEnv, SubprocVectorEnv
 
 __all__ = ["D4RLEnv"]
@@ -57,7 +58,7 @@ def _to_info_list(infos: Any, batch_size: int) -> list[dict[str, Any]]:
     return [{} for _ in range(batch_size)]
 
 
-class D4RLEnv(gym.Env):
+class D4RLEnv(BootstrapResetPlannerMixin, gym.Env):
     """D4RL env wrapper compatible with EnvWorker chunk API."""
 
     def __init__(
@@ -367,42 +368,6 @@ class D4RLEnv(gym.Env):
             full_obs = self._last_obs.copy()
         full_obs[env_idx] = partial_obs
         return full_obs
-
-    def _clone_reset_state_ids(self) -> np.ndarray:
-        return np.array(self.reset_state_ids, copy=True)
-
-    def _snapshot_bootstrap_planner_state(self) -> dict[str, Any]:
-        return {
-            "reset_state_ids": self._clone_reset_state_ids(),
-            "start_idx": int(self.start_idx),
-            "generator_state": copy.deepcopy(self._generator.bit_generator.state),
-        }
-
-    def _restore_bootstrap_planner_state(self, state: dict[str, Any]) -> None:
-        self.reset_state_ids = np.array(state["reset_state_ids"], copy=True)
-        self.start_idx = int(state["start_idx"])
-        self._generator.bit_generator.state = copy.deepcopy(state["generator_state"])
-
-    def plan_next_bootstrap_reset(self) -> dict[str, Any]:
-        if self.use_fixed_reset_state_ids and self.is_start:
-            plan_ids = self._clone_reset_state_ids()
-        else:
-            self.update_reset_state_ids()
-            plan_ids = self._clone_reset_state_ids()
-        return {
-            "reset_state_ids": plan_ids,
-            "planner_state": self._snapshot_bootstrap_planner_state(),
-        }
-
-    def reset_to_bootstrap_plan(
-        self, plan: dict[str, Any]
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
-        planner_state = None if plan is None else plan.get("planner_state", None)
-        if planner_state is not None:
-            self._restore_bootstrap_planner_state(planner_state)
-        self.is_start = False
-        reset_state_ids = None if plan is None else plan.get("reset_state_ids", None)
-        return self.reset(reset_state_ids=reset_state_ids)
 
     def reset(
         self,

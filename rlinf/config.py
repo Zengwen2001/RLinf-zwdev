@@ -896,8 +896,8 @@ def validate_embodied_cfg(cfg):
             cfg.runner.env_double_buffer.backend = str(
                 env_double_buffer_cfg.get("backend", "thread")
             ).lower()
-            assert cfg.runner.env_double_buffer.backend in {"thread", "process"}, (
-                "runner.env_double_buffer.backend must be either 'thread' or 'process'"
+            assert cfg.runner.env_double_buffer.backend == "thread", (
+                "runner.env_double_buffer.backend currently supports only 'thread'"
             )
         if (
             SupportedEnvType(cfg.env.train.env_type) == SupportedEnvType.MANISKILL
