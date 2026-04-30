@@ -1,4 +1,4 @@
-# Copyright 2025 The RLinf Authors.
+# Copyright 2026 The RLinf Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,9 +19,22 @@ import numpy as np
 
 
 class BootstrapResetPlannerMixin:
+    """Mixin for environments that participate in env double-buffer bootstrap planning.
+
+    Provides the plan/apply protocol so that the active pool can snapshot its
+    planner state (reseeded reset IDs, start offset, generator state) and the
+    standby pool can restore it for a deterministic hand-off at epoch boundaries.
+
+    Set ``_manages_bootstrap_state = False`` on subclasses that do not own
+    bootstrap state (e.g. stateless procedural envs). In that case
+    ``plan_next_bootstrap_reset`` returns ``None`` and the standby pool resets
+    independently, providing latency hiding without state continuity.
+    """
+
     bootstrap_planner_array_fields = ("reset_state_ids",)
     bootstrap_planner_scalar_fields = ("start_idx",)
     bootstrap_planner_generator_fields = (("generator_state", "_generator"),)
+    _manages_bootstrap_state: bool = True
 
     def _clone_reset_state_ids(self):
         return np.array(self.reset_state_ids, copy=True)
@@ -47,6 +60,9 @@ class BootstrapResetPlannerMixin:
             generator.bit_generator.state = copy.deepcopy(state[state_key])
 
     def plan_next_bootstrap_reset(self) -> dict[str, Any]:
+        """Produce a plan dict with the next reset IDs and a snapshot of planner state."""
+        if not self._manages_bootstrap_state:
+            return None
         if self.use_fixed_reset_state_ids and self.is_start:
             plan_ids = self._clone_reset_state_ids()
         else:
@@ -62,9 +78,4 @@ class BootstrapResetPlannerMixin:
         planner_state = None if plan is None else plan.get("planner_state", None)
         if planner_state is not None:
             self._restore_bootstrap_planner_state(planner_state)
-        self.is_start = False
         return plan.get("reset_state_ids", None) if plan is not None else None
-
-    def reset_to_bootstrap_plan(self, plan):
-        reset_state_ids = self.apply_bootstrap_plan(plan)
-        return self.reset(reset_state_ids=reset_state_ids)

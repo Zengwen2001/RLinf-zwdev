@@ -153,6 +153,8 @@ class EnvWorker(Worker):
                 env_cfg=self.cfg.env.train,
                 num_envs_per_stage=self.train_num_envs_per_stage,
             )
+            self._init_env()
+            self._maybe_enable_env_double_buffer(train_env_cls)
         if self.enable_eval:
             eval_env_cls = get_env_cls(self.cfg.env.eval.env_type, self.cfg.env.eval)
             self.eval_env_list = self._setup_env_and_wrappers(
@@ -160,10 +162,6 @@ class EnvWorker(Worker):
                 env_cfg=self.cfg.env.eval,
                 num_envs_per_stage=self.eval_num_envs_per_stage,
             )
-
-        if not self.only_eval:
-            self._init_env()
-            self._maybe_enable_env_double_buffer(train_env_cls)
 
     def update_env_cfg(self):
         if not self.only_eval:
@@ -430,33 +428,25 @@ class EnvWorker(Worker):
     def _maybe_enable_env_double_buffer(self, train_env_cls) -> None:
         if not self.env_double_buffer_requested:
             return
-        if self.cfg.env.train.auto_reset:
-            self._warn_env_double_buffer_once(
-                "env.train.auto_reset=True is not supported."
-            )
-            return
         if not self._train_envs_support_double_buffer(self.env_list):
             self._warn_env_double_buffer_once(
                 "training env does not implement bootstrap reset planning."
             )
             return
-        standby_env_list = self._setup_env_and_wrappers(
-            env_cls=train_env_cls,
-            env_cfg=self.cfg.env.train,
-            num_envs_per_stage=self.train_num_envs_per_stage,
-        )
-        if self.enable_offload:
-            for env in standby_env_list:
-                if hasattr(env, "offload"):
-                    env.offload()
-        if not self._train_envs_support_double_buffer(standby_env_list):
-            self._close_env_list(standby_env_list)
+        try:
+            self._standby_env_list = self._setup_env_and_wrappers(
+                env_cls=train_env_cls,
+                env_cfg=self.cfg.env.train,
+                num_envs_per_stage=self.train_num_envs_per_stage,
+            )
+        except Exception as exc:
             self._warn_env_double_buffer_once(
-                "standby training env does not implement bootstrap reset planning."
+                f"Failed to create standby env pool (likely OOM); "
+                f"disabling env double buffer. Error: {exc}"
             )
             return
         self.env_double_buffer_coordinator = EnvDoubleBufferCoordinator(
-            env_pools=[self.env_list, standby_env_list],
+            env_pools=[self.env_list, self._standby_env_list],
             bootstrap_envs=self._bootstrap_train_envs,
             send_bootstrap=self._send_train_bootstrap,
             set_active_envs=self._set_active_train_envs,
@@ -966,7 +956,6 @@ class EnvWorker(Worker):
             for stage_id in range(self.stage_num):
                 train_env = env_list[stage_id]
                 if bootstrap_plans is None:
-                    train_env.is_start = True
                     extracted_obs, infos = train_env.reset()
                 else:
                     reset_state_ids = train_env.apply_bootstrap_plan(
@@ -1083,15 +1072,17 @@ class EnvWorker(Worker):
             if self.env_double_buffer_enabled:
                 if self.env_double_buffer_coordinator is None:
                     raise RuntimeError("Env double buffer coordinator is missing.")
-                if epoch==0 and self._prefetched_train_bootstrap is not None:
+                if epoch == 0 and self._prefetched_train_bootstrap is not None:
                     env_outputs = self._prefetched_train_bootstrap
                     self._prefetched_train_bootstrap = None
-                elif epoch==0:
+                elif epoch == 0:
                     env_outputs = self._bootstrap_and_send_train(rollout_channel)
                 else:
                     env_outputs = await (
-                        self.env_double_buffer_coordinator.consume_bootstrap(rollout_channel)
+                        self.env_double_buffer_coordinator.consume_bootstrap(
+                            rollout_channel
                         )
+                    )
                 if epoch + 1 < self.rollout_epoch:
                     self.env_double_buffer_coordinator.schedule_next_bootstrap_prepare()
             else:

@@ -31,6 +31,7 @@ from rlinf.envs.behavior.utils import (
     convert_uint8_rgb,
     setup_omni_cfg,
 )
+from rlinf.envs.bootstrap_planning import BootstrapResetPlannerMixin
 from rlinf.envs.utils import list_of_dict_to_dict_of_list, to_tensor
 from rlinf.utils.logging import get_logger
 
@@ -235,7 +236,7 @@ class BehaviorProcessProxy:
             pass
 
 
-class BehaviorEnv(gym.Env):
+class BehaviorEnv(BootstrapResetPlannerMixin, gym.Env):
     def __init__(
         self,
         cfg,
@@ -272,6 +273,8 @@ class BehaviorEnv(gym.Env):
         if self.record_metrics:
             self._init_metrics()
         self._init_env()
+
+    _manages_bootstrap_state = False
 
     def _split_num_envs(self, num_envs: int, num_processes: int) -> int:
         """Split ``num_envs`` across ``num_processes`` shards as evenly as possible."""
@@ -647,14 +650,6 @@ class BehaviorEnv(gym.Env):
     def update_reset_state_ids(self):
         # use for multi task training
         pass
-
-    def plan_next_bootstrap_reset(self):
-        return None
-
-    def reset_to_bootstrap_plan(self, plan):
-        if plan is not None:
-            raise ValueError("BehaviorEnv does not expect an explicit bootstrap plan.")
-        return self.reset()
 
     def close(self):
         self.env_close()

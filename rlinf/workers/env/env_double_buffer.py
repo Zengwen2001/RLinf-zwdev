@@ -1,4 +1,4 @@
-# Copyright 2025 The RLinf Authors.
+# Copyright 2026 The RLinf Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -29,6 +29,24 @@ class PendingTrainBootstrap:
 
 
 class EnvDoubleBufferCoordinator:
+    """Manages two environment pools to hide bootstrap (reset) latency across rollout epochs.
+
+    While one pool is actively rolling out, the coordinator snapshots the
+    active pool's reset planner state, submits a background bootstrap on the
+    standby pool with that state, and swaps the pools at the next epoch
+    boundary.
+
+    Args:
+        env_pools: Two env lists; index 0 must be the initially active pool.
+        bootstrap_envs: Callable ``(env_list, bootstrap_plans) -> list[EnvOutput]``.
+        send_bootstrap: Callable to ship env outputs through a rollout channel.
+        set_active_envs: Callable that replaces ``self.env_list`` on the worker.
+        record_timer_duration: Metrics hook ``(tag, duration_seconds)``.
+        log_warning: Logging hook.
+        on_disabled: Optional callback invoked when the coordinator disables itself.
+        rank: Worker rank for thread naming.
+    """
+
     def __init__(
         self,
         *,
@@ -65,7 +83,7 @@ class EnvDoubleBufferCoordinator:
     @staticmethod
     def env_supports_double_buffer(env: Any) -> bool:
         return hasattr(env, "plan_next_bootstrap_reset") and hasattr(
-            env, "reset_to_bootstrap_plan"
+            env, "apply_bootstrap_plan"
         )
 
     @classmethod
@@ -109,7 +127,8 @@ class EnvDoubleBufferCoordinator:
         self._executor.shutdown(wait=True, cancel_futures=True)
 
     def _plan_bootstrap_for_pool(self, pool_idx: int) -> list[Any]:
-        return [env.plan_next_bootstrap_reset() for env in self.env_pools[pool_idx]]
+        plans = [env.plan_next_bootstrap_reset() for env in self.env_pools[pool_idx]]
+        return plans if any(p is not None for p in plans) else None
 
     def _prepare_bootstrap_for_pool(
         self, pool_idx: int, bootstrap_plans: list[Any]
@@ -122,6 +141,7 @@ class EnvDoubleBufferCoordinator:
         return pool_idx, env_outputs, time.perf_counter() - start_time
 
     def schedule_next_bootstrap_prepare(self) -> None:
+        """Plan the next bootstrap from the active pool and submit background prepare on the standby pool."""
         if self.disabled:
             return
         if self.pending_bootstrap is not None:
@@ -143,6 +163,7 @@ class EnvDoubleBufferCoordinator:
         )
 
     async def consume_bootstrap(self, rollout_channel: Any) -> list[Any]:
+        """Await the pending background bootstrap, swap to the standby pool, and send the result."""
         if self.disabled:
             env_outputs = self._bootstrap_envs(
                 self.env_pools[self.active_pool_idx],
