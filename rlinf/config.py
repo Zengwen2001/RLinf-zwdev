@@ -893,10 +893,9 @@ def validate_embodied_cfg(cfg):
             cfg.runner.env_double_buffer.enabled = bool(
                 env_double_buffer_cfg.get("enabled", False)
             )
-            if (
-                cfg.runner.env_double_buffer.enabled
-                and cfg.env.train.get("enable_offload", False)
-                and cfg.env.train.get("auto_reset", False)
+            if cfg.runner.env_double_buffer.enabled and (
+                cfg.env.train.get("enable_offload", False)
+                or cfg.env.train.get("auto_reset", False)
             ):
                 logging.warning(
                     "env_double_buffer is incompatible with enable_offload or auto_reset, "
