@@ -491,7 +491,3 @@ class CalvinEnv(BootstrapResetPlannerMixin, gym.Env):
                     )
                 else:
                     self.current_task_idx[env_id] = 5
-
-    def close(self):
-        if hasattr(self, "env") and self.env is not None:
-            self.env.close()

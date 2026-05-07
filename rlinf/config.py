@@ -886,28 +886,20 @@ def validate_embodied_cfg(cfg):
         ) and not cfg.env.train.get("enable_offload", False)
         env_double_buffer_cfg = cfg.runner.get("env_double_buffer", None)
         if env_double_buffer_cfg is None:
-            cfg.runner.env_double_buffer = OmegaConf.create(
-                {"enabled": False, "backend": "thread"}
-            )
+            cfg.runner.env_double_buffer = False
         else:
-            cfg.runner.env_double_buffer.enabled = bool(
-                env_double_buffer_cfg.get("enabled", False)
-            )
-            if cfg.runner.env_double_buffer.enabled and (
-                cfg.env.train.get("enable_offload", False)
-                or cfg.env.train.get("auto_reset", False)
-            ):
-                logging.warning(
-                    "env_double_buffer is incompatible with enable_offload or auto_reset, "
-                    "forcing env_double_buffer.enabled=False."
+            if not isinstance(env_double_buffer_cfg, bool):
+                raise TypeError(
+                    "runner.env_double_buffer must be a boolean, "
+                    "e.g. env_double_buffer: true."
                 )
-                cfg.runner.env_double_buffer.enabled = False
-            cfg.runner.env_double_buffer.backend = str(
-                env_double_buffer_cfg.get("backend", "thread")
-            ).lower()
-            assert cfg.runner.env_double_buffer.backend == "thread", (
-                "runner.env_double_buffer.backend currently supports only 'thread'"
-            )
+            cfg.runner.env_double_buffer = env_double_buffer_cfg
+            if cfg.runner.env_double_buffer and cfg.env.train.get("auto_reset", False):
+                logging.warning(
+                    "env_double_buffer is incompatible with auto_reset, "
+                    "forcing env_double_buffer=False."
+                )
+                cfg.runner.env_double_buffer = False
         if (
             SupportedEnvType(cfg.env.train.env_type) == SupportedEnvType.MANISKILL
             or SupportedEnvType(cfg.env.eval.env_type) == SupportedEnvType.MANISKILL

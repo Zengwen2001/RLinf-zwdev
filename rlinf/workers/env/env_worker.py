@@ -59,9 +59,8 @@ class EnvWorker(Worker):
         self._prefetched_train_bootstrap: list[EnvOutput] | None = None
         self.rollout_epoch = self.cfg.algorithm.get("rollout_epoch", 1)
         self._component_placement = HybridComponentPlacement(cfg, Cluster())
-        env_double_buffer_cfg = self.cfg.runner.get("env_double_buffer", {})
         self.env_double_buffer_requested = bool(
-            env_double_buffer_cfg.get("enabled", False)
+            self.cfg.runner.get("env_double_buffer", False)
         )
         self.env_double_buffer_enabled = False
         self.env_double_buffer_coordinator: EnvDoubleBufferCoordinator | None = None
@@ -242,13 +241,11 @@ class EnvWorker(Worker):
         env_list = []
 
         for stage_id in range(self.stage_num):
-            seed_offset = self._rank * self.stage_num + stage_id
-            total_num_processes = self._world_size * self.stage_num
             env = env_cls(
                 cfg=env_cfg,
                 num_envs=num_envs_per_stage,
-                seed_offset=seed_offset,
-                total_num_processes=total_num_processes,
+                seed_offset=self._rank * self.stage_num + stage_id,
+                total_num_processes=self._world_size * self.stage_num,
                 worker_info=self.worker_info,
             )
             if env_cfg.video_cfg.save_video:
@@ -388,8 +385,7 @@ class EnvWorker(Worker):
                 extracted_obs, _ = self.env_list[i].reset()
                 self.last_obs_list.append(extracted_obs)
                 self.last_intervened_info_list.append((None, None))
-            if self.enable_offload and hasattr(self.env_list[i], "offload"):
-                self.env_list[i].offload()
+        self._offload_train_envs()
 
     def _warn_env_double_buffer_once(self, reason: str) -> None:
         if self._double_buffer_warning_emitted:
@@ -411,10 +407,23 @@ class EnvWorker(Worker):
     def _set_active_train_envs(self, env_list: list[Any]) -> None:
         self.env_list = env_list
 
+    def _offload_train_envs(self) -> None:
+        if not self.enable_offload:
+            return
+        if (
+            self.env_double_buffer_enabled
+            and self.env_double_buffer_coordinator is not None
+        ):
+            self.env_double_buffer_coordinator.offload_env_pools()
+            return
+        for env in self.env_list:
+            if hasattr(env, "offload"):
+                env.offload()
+
     def _train_envs_support_double_buffer(self, env_list: list[Any]) -> bool:
         return EnvDoubleBufferCoordinator.envs_support_double_buffer(env_list)
 
-    def _bootstrap_train_envs(
+    def _bootstrap_envs_for_double_buffer(
         self, env_list: list[Any], bootstrap_plans: list[Any] | None
     ) -> list[EnvOutput]:
         return self._bootstrap_step_for_envs(
@@ -447,7 +456,7 @@ class EnvWorker(Worker):
             return
         self.env_double_buffer_coordinator = EnvDoubleBufferCoordinator(
             env_pools=[self.env_list, self._standby_env_list],
-            bootstrap_envs=self._bootstrap_train_envs,
+            bootstrap_envs=self._bootstrap_envs_for_double_buffer,
             send_bootstrap=self._send_train_bootstrap,
             set_active_envs=self._set_active_train_envs,
             record_timer_duration=self._record_timer_duration,
@@ -456,26 +465,20 @@ class EnvWorker(Worker):
             rank=self._rank,
         )
         self.env_double_buffer_enabled = True
-        self.log_info(
-            f"Enabled env double buffer with thread backend on rank={self._rank}."
-        )
+        self._offload_train_envs()
+        self.log_info(f"Enabled env double buffer on rank={self._rank}.")
 
     def _record_timer_duration(self, tag: str, duration: float) -> None:
         self._timer_metrics[tag] = self._timer_metrics.get(tag, 0.0) + duration
-
-    def _get_zero_bootstrap_dones(self) -> torch.Tensor:
-        return (
-            torch.zeros((self.train_num_envs_per_stage,), dtype=bool)
-            .unsqueeze(1)
-            .repeat(1, self.cfg.actor.model.num_action_chunks)
-        )
 
     def _build_train_bootstrap_env_output(
         self,
         extracted_obs: dict[str, Any],
         infos: dict[str, Any],
+        dones: torch.Tensor,
+        intervene_actions: torch.Tensor | None = None,
+        intervene_flags: torch.Tensor | None = None,
     ) -> EnvOutput:
-        dones = self._get_zero_bootstrap_dones()
         return EnvOutput(
             obs=extracted_obs,
             dones=dones,
@@ -484,8 +487,8 @@ class EnvWorker(Worker):
             final_obs=infos["final_observation"]
             if "final_observation" in infos
             else None,
-            intervene_actions=None,
-            intervene_flags=None,
+            intervene_actions=intervene_actions,
+            intervene_flags=intervene_flags,
         )
 
     def _append_double_buffer_metrics(self, env_metrics: dict[str, list]) -> None:
@@ -814,16 +817,16 @@ class EnvWorker(Worker):
         # reset
         if mode == "train":
             for i in range(self.stage_num):
-                if self.cfg.env.train.video_cfg.save_video and hasattr(
-                    self.env_list[i], "flush_video"
+                if self.cfg.env.train.video_cfg.save_video and isinstance(
+                    self.env_list[i], RecordVideo
                 ):
                     self.env_list[i].flush_video()
                 if not self.env_double_buffer_enabled:
                     self.env_list[i].update_reset_state_ids()
         elif mode == "eval":
             for i in range(self.stage_num):
-                if self.cfg.env.eval.video_cfg.save_video and hasattr(
-                    self.eval_env_list[i], "flush_video"
+                if self.cfg.env.eval.video_cfg.save_video and isinstance(
+                    self.eval_env_list[i], RecordVideo
                 ):
                     self.eval_env_list[i].flush_video()
                 if not self.cfg.env.eval.auto_reset:
@@ -952,9 +955,15 @@ class EnvWorker(Worker):
         bootstrap_plans: list[Any] | None = None,
     ) -> list[EnvOutput]:
         env_outputs: list[EnvOutput] = []
+        dones = (
+            torch.zeros((self.train_num_envs_per_stage,), dtype=bool)
+            .unsqueeze(1)
+            .repeat(1, self.cfg.actor.model.num_action_chunks)
+        )
         if not self.cfg.env.train.auto_reset:
             for stage_id in range(self.stage_num):
                 train_env = env_list[stage_id]
+                train_env.is_start = True
                 if bootstrap_plans is None:
                     extracted_obs, infos = train_env.reset()
                 else:
@@ -965,22 +974,23 @@ class EnvWorker(Worker):
                         reset_state_ids=reset_state_ids
                     )
                 env_outputs.append(
-                    self._build_train_bootstrap_env_output(extracted_obs, infos)
+                    self._build_train_bootstrap_env_output(
+                        extracted_obs,
+                        infos,
+                        dones,
+                    )
                 )
         else:
-            dones = self._get_zero_bootstrap_dones()
-
             for stage_id in range(self.stage_num):
-                env_output = EnvOutput(
-                    obs=self.last_obs_list[stage_id],
-                    rewards=None,
-                    dones=dones,
-                    terminations=dones.clone(),
-                    truncations=dones.clone(),
-                    intervene_actions=self.last_intervened_info_list[stage_id][0],
-                    intervene_flags=self.last_intervened_info_list[stage_id][1],
+                env_outputs.append(
+                    self._build_train_bootstrap_env_output(
+                        self.last_obs_list[stage_id],
+                        {},
+                        dones,
+                        intervene_actions=self.last_intervened_info_list[stage_id][0],
+                        intervene_flags=self.last_intervened_info_list[stage_id][1],
+                    )
                 )
-                env_outputs.append(env_output)
 
         return env_outputs
 
@@ -1239,9 +1249,7 @@ class EnvWorker(Worker):
             cooperative_yield=False,
         )
 
-        for env in self.env_list:
-            if self.enable_offload and hasattr(env, "offload"):
-                env.offload()
+        self._offload_train_envs()
 
         return env_metrics
 

@@ -447,7 +447,3 @@ class MetaWorldEnv(BootstrapResetPlannerMixin, gym.Env):
             return reward_diff
         else:
             return reward
-
-    def close(self):
-        if hasattr(self, "env") and self.env is not None:
-            self.env.close()

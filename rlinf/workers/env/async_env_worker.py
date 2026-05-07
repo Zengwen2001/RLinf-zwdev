@@ -92,4 +92,3 @@ class AsyncEnvWorker(EnvWorker):
     async def stop(self):
         if self._interact_task is not None and not self._interact_task.done():
             self._interact_task.cancel()
-        self.close_envs()

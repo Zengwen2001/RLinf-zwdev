@@ -24,7 +24,7 @@ import torch
 @dataclass
 class PendingTrainBootstrap:
     pool_idx: int
-    bootstrap_plans: list[Any]
+    bootstrap_plans: list[Any] | None
     future: concurrent.futures.Future
 
 
@@ -82,9 +82,14 @@ class EnvDoubleBufferCoordinator:
 
     @staticmethod
     def env_supports_double_buffer(env: Any) -> bool:
-        return hasattr(env, "plan_next_bootstrap_reset") and hasattr(
-            env, "apply_bootstrap_plan"
-        )
+        current_env = env
+        seen: set[int] = set()
+        while current_env is not None and id(current_env) not in seen:
+            seen.add(id(current_env))
+            if getattr(type(current_env), "supports_env_double_buffer", False):
+                return True
+            current_env = getattr(current_env, "__dict__", {}).get("env", None)
+        return False
 
     @classmethod
     def envs_support_double_buffer(cls, env_list: list[Any]) -> bool:
@@ -95,43 +100,31 @@ class EnvDoubleBufferCoordinator:
         self._set_active_envs(self.env_pools[pool_idx])
 
     def reset_run_state(self) -> None:
-        self.cancel_pending()
         self.prepare_total = 0
         self.prepare_hits = 0
         self.fallback_count = 0
 
-    def disable(self, *, cancel_pending: bool = True) -> None:
+    def disable(self) -> None:
         self.disabled = True
         if self._on_disabled is not None:
             self._on_disabled()
-        if cancel_pending:
-            self.cancel_pending()
-
-    def cancel_pending(self, *, wait: bool = True) -> None:
-        pending_bootstrap = self.pending_bootstrap
-        if pending_bootstrap is None:
-            return
-        cancelled = pending_bootstrap.future.cancel()
-        if wait and not cancelled:
-            try:
-                pending_bootstrap.future.result()
-            except Exception as exc:
-                self._log_warning(
-                    "Env double buffer pending prepare finished with an error while "
-                    f"waiting for cancellation/shutdown: {exc}"
-                )
-        self.pending_bootstrap = None
 
     def shutdown(self) -> None:
-        self.cancel_pending(wait=True)
-        self._executor.shutdown(wait=True, cancel_futures=True)
+        self._executor.shutdown(wait=True)
+        self.pending_bootstrap = None
 
-    def _plan_bootstrap_for_pool(self, pool_idx: int) -> list[Any]:
+    def offload_env_pools(self) -> None:
+        for env_pool in self.env_pools:
+            for env in env_pool:
+                if hasattr(env, "offload"):
+                    env.offload()
+
+    def _plan_bootstrap_for_pool(self, pool_idx: int) -> list[Any] | None:
         plans = [env.plan_next_bootstrap_reset() for env in self.env_pools[pool_idx]]
         return plans if any(p is not None for p in plans) else None
 
     def _prepare_bootstrap_for_pool(
-        self, pool_idx: int, bootstrap_plans: list[Any]
+        self, pool_idx: int, bootstrap_plans: list[Any] | None
     ) -> tuple[int, list[Any], float]:
         start_time = time.perf_counter()
         env_outputs = self._bootstrap_envs(
@@ -199,7 +192,7 @@ class EnvDoubleBufferCoordinator:
                     pending_bootstrap.bootstrap_plans,
                 )
             except Exception as fallback_exc:
-                self.disable(cancel_pending=False)
+                self.disable()
                 self._log_warning(
                     "Fatal env double buffer fallback failure; disabling coordinator. "
                     "The active pool could not reset with the already planned "
@@ -221,8 +214,12 @@ class EnvDoubleBufferCoordinator:
         if task_ready:
             self.prepare_hits += 1
         self._record_timer_duration("bootstrap_prepare_bg", prepare_duration)
-        if pool_idx == pending_bootstrap.pool_idx:
-            self._set_active_pool_idx(pool_idx)
+        if pool_idx != pending_bootstrap.pool_idx:
+            raise RuntimeError(
+                "Env double buffer prepared an unexpected pool: "
+                f"expected={pending_bootstrap.pool_idx}, actual={pool_idx}."
+            )
+        self._set_active_pool_idx(pool_idx)
         self._send_bootstrap(rollout_channel, env_outputs)
         return env_outputs
 
