@@ -211,7 +211,7 @@ def validate_dreamzero_sft_model_cfg(model_cfg: DictConfig) -> DictConfig:
     return model_cfg
 
 
-@dataclass
+@dataclass(init=False)
 class DreamZeroConfig(VLAConfig):
     model_type = "dreamzero"
     backbone_cfg: PretrainedConfig = field(

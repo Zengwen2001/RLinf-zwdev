@@ -23,9 +23,23 @@ from rlinf.runners.embodied_eval_runner import EmbodiedEvalRunner
 from rlinf.scheduler import Cluster
 from rlinf.utils.placement import HybridComponentPlacement
 from rlinf.workers.env.env_worker import EnvWorker
-from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
 mp.set_start_method("spawn", force=True)
+
+
+def _get_rollout_worker_cls(cfg):
+    backend = str(cfg.rollout.get("generation_backend", "huggingface")).lower()
+    if backend == "huggingface":
+        from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
+
+        return MultiStepRolloutWorker
+    if backend == "sglang":
+        from rlinf.workers.rollout.dreamzero_sglang_worker import (
+            DreamZeroSGLangRolloutWorker,
+        )
+
+        return DreamZeroSGLangRolloutWorker
+    raise ValueError(f"Unsupported rollout.generation_backend: {backend!r}")
 
 
 @hydra.main(
@@ -42,8 +56,9 @@ def main(cfg) -> None:
     component_placement = HybridComponentPlacement(cfg, cluster)
 
     # Create rollout worker group
+    rollout_worker_cls = _get_rollout_worker_cls(cfg)
     rollout_placement = component_placement.get_strategy("rollout")
-    rollout_group = MultiStepRolloutWorker.create_group(cfg).launch(
+    rollout_group = rollout_worker_cls.create_group(cfg).launch(
         cluster, name=cfg.rollout.group_name, placement_strategy=rollout_placement
     )
     # Create env worker group
