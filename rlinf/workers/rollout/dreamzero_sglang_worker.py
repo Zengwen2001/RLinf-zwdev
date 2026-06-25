@@ -15,6 +15,7 @@
 import copy
 import os
 import socket
+import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from types import SimpleNamespace
@@ -162,24 +163,21 @@ class DreamZeroSGLangRolloutWorker(MultiStepRolloutWorker):
         self._init_sglang_pipeline(rollout_model_config)
         self._init_eval_session_state()
 
-        self.dst_ranks = {"eval": self._setup_dst_ranks(self.total_num_eval_envs)}
-        self.src_ranks = {"eval": self._setup_src_ranks(self.total_num_eval_envs)}
-        self.log_info(f"Rollout worker initialized with dst_ranks: {self.dst_ranks}")
-        self.log_info(f"Rollout worker initialized with src_ranks: {self.src_ranks}")
         self.setup_sample_params()
 
     def _init_sglang_pipeline(self, model_cfg: DictConfig) -> None:
-        self._disable_groot_scheduler_compile()
-
-        from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-            maybe_init_distributed_environment_and_model_parallel,
-            model_parallel_is_initialized,
-        )
         from sglang.multimodal_gen.configs.pipeline_configs.dreamzero import (
             DreamZeroPipelineConfig,
         )
         from sglang.multimodal_gen.configs.sample.dreamzero import (
             DreamZeroSamplingParams,
+        )
+        from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+            maybe_init_distributed_environment_and_model_parallel,
+            model_parallel_is_initialized,
+        )
+        from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
+            DiffGenerator,
         )
         from sglang.multimodal_gen.runtime.pipelines.dreamzero_pipeline import (
             DreamZeroPipeline,
@@ -192,13 +190,26 @@ class DreamZeroSGLangRolloutWorker(MultiStepRolloutWorker):
 
         action_head_cfg = model_cfg.action_head_cfg.config
         sglang_cfg = self.cfg.rollout.get("sglang", {})
+        if bool(sglang_cfg.get("disable_groot_scheduler_compile", True)):
+            os.environ["DREAMZERO_DISABLE_GROOT_SCHEDULER_COMPILE"] = "1"
+            self._disable_groot_scheduler_compile()
+        tp_size = int(sglang_cfg.get("tp_size", 1))
+        sp_size = int(sglang_cfg.get("sp_size", 1))
+        cfg_parallel_degree = int(sglang_cfg.get("cfg_parallel_degree", 1))
+        sglang_world_size = tp_size * sp_size * cfg_parallel_degree
         max_sessions = int(sglang_cfg.get("max_sessions", self.total_num_eval_envs))
         num_inference_steps = int(sglang_cfg.get("num_inference_steps", 16))
+        port_offset = int(getattr(self, "_rank", 0)) * int(
+            sglang_cfg.get("port_stride", 100)
+        )
+        http_port = int(sglang_cfg.get("port", 30000)) + port_offset
+        scheduler_port = int(sglang_cfg.get("scheduler_port", 5555)) + port_offset
+        master_port = int(sglang_cfg.get("master_port", 30005)) + port_offset
         pipeline_config = DreamZeroPipelineConfig(
             dreamzero_compile_components=bool(
                 sglang_cfg.get("compile_components", True)
             ),
-            dreamzero_sequence_parallel_size=int(sglang_cfg.get("sp_size", 1)),
+            dreamzero_sequence_parallel_size=sp_size,
             dreamzero_max_sessions=max_sessions,
             cfg_scale=float(sglang_cfg.get("cfg_scale", 5.0)),
             embodiment_tag=str(model_cfg.embodiment_tag),
@@ -222,8 +233,10 @@ class DreamZeroSGLangRolloutWorker(MultiStepRolloutWorker):
             pipeline_class_name="DreamZeroPipeline",
             pipeline_config=pipeline_config,
             attention_backend=sglang_cfg.get("attention_backend", "TORCH_SDPA"),
-            tp_size=int(sglang_cfg.get("tp_size", 1)),
-            cfg_parallel_degree=int(sglang_cfg.get("cfg_parallel_degree", 1)),
+            num_gpus=sglang_world_size,
+            tp_size=tp_size,
+            sp_degree=sp_size,
+            cfg_parallel_degree=cfg_parallel_degree,
             component_paths={
                 "dreamzero_dit": str(model_cfg.model_path),
                 # The VAE loader reads runtime config from config.json before it
@@ -233,17 +246,51 @@ class DreamZeroSGLangRolloutWorker(MultiStepRolloutWorker):
                 "dreamzero_image_encoder": str(model_cfg.image_encoder_pretrained_path),
             },
             log_level=str(sglang_cfg.get("log_level", "info")),
+            port=http_port,
+            scheduler_port=scheduler_port,
+            master_port=master_port,
         )
         self._dreamzero_sampling_params_cls = DreamZeroSamplingParams
         self._sglang_server_args = server_args
         set_global_server_args(server_args)
-        self._init_sglang_single_rank_parallel_state(
-            maybe_init_distributed_environment_and_model_parallel,
-            model_parallel_is_initialized,
-            server_args,
-            sglang_cfg,
+        self._sglang_use_scheduler = sglang_world_size > 1
+        self._sglang_generator = None
+        self.sglang_pipeline = None
+        if self._sglang_use_scheduler:
+            self._validate_visible_sglang_devices(sglang_world_size)
+            self._sglang_generator = DiffGenerator.from_server_args(
+                server_args,
+                local_mode=True,
+            )
+            self._check_local_scheduler_ready()
+        else:
+            self._init_sglang_single_rank_parallel_state(
+                maybe_init_distributed_environment_and_model_parallel,
+                model_parallel_is_initialized,
+                server_args,
+                sglang_cfg,
+            )
+            self.sglang_pipeline = DreamZeroPipeline(
+                str(model_cfg.model_path), server_args
+            )
+
+    def _validate_visible_sglang_devices(self, sglang_world_size: int) -> None:
+        # WorkerGroup sets VISIBLE_DEVICES before accelerator-specific helpers
+        # translate it to CUDA_VISIBLE_DEVICES.
+        visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES") or os.environ.get(
+            "VISIBLE_DEVICES"
         )
-        self.sglang_pipeline = DreamZeroPipeline(str(model_cfg.model_path), server_args)
+        if not visible_devices:
+            return
+        visible_count = len([item for item in visible_devices.split(",") if item])
+        if visible_count < sglang_world_size:
+            raise RuntimeError(
+                "DreamZero sglang parallel eval requires at least "
+                f"{sglang_world_size} visible device(s), but only sees "
+                f"{visible_count}: {visible_devices!r}. Set "
+                "`rollout.tensor_parallel_size` and placement so one rollout "
+                "worker owns the full sglang parallel group."
+            )
 
     def _init_sglang_single_rank_parallel_state(
         self,
@@ -254,7 +301,10 @@ class DreamZeroSGLangRolloutWorker(MultiStepRolloutWorker):
     ) -> None:
         if model_parallel_is_initialized():
             return
-        if torch.distributed.is_initialized() and torch.distributed.get_world_size() != 1:
+        if (
+            torch.distributed.is_initialized()
+            and torch.distributed.get_world_size() != 1
+        ):
             raise RuntimeError(
                 "sglang in-process DreamZero eval expects a per-rollout-rank "
                 "single-process torch distributed group, but torch.distributed is "
@@ -304,6 +354,24 @@ class DreamZeroSGLangRolloutWorker(MultiStepRolloutWorker):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.bind(("127.0.0.1", 0))
             return int(sock.getsockname()[1])
+
+    @staticmethod
+    def _check_local_scheduler_ready() -> None:
+        from sglang.multimodal_gen.runtime.scheduler_client import (
+            sync_scheduler_client,
+        )
+
+        last_error = None
+        for _ in range(60):
+            try:
+                if sync_scheduler_client.ping():
+                    return
+            except Exception as exc:
+                last_error = exc
+            time.sleep(1)
+        raise ConnectionError(
+            "DreamZero local sglang scheduler did not become ready within 60s."
+        ) from last_error
 
     def _init_eval_session_state(self) -> None:
         sglang_cfg = self.cfg.rollout.get("sglang", {})
@@ -415,12 +483,67 @@ class DreamZeroSGLangRolloutWorker(MultiStepRolloutWorker):
             extra={
                 "dreamzero_normalized_input": normalized_input,
                 "dreamzero_original_obs": original_obs,
-                "dreamzero_unapply": self.action_adapter.unapply,
                 "dreamzero_session_id": session_id,
                 "dreamzero_reset_session": reset_session,
             },
             suppress_logs=True,
         )
+
+    def _forward_sglang_request(self, req):
+        if self._sglang_use_scheduler:
+            # DiffGenerator.generate() performs image/video prompt parsing and
+            # file output handling. DreamZero rollout already builds a Req with
+            # normalized tensors, so we call the scheduler client boundary
+            # directly and keep this contract local to the worker.
+            response = self._sglang_generator._send_to_scheduler_and_wait_for_response(
+                [req]
+            )
+            error = getattr(response, "error", None)
+            if error is not None:
+                raise RuntimeError(f"DreamZero sglang scheduler request failed: {error}")
+            return response
+        return self.sglang_pipeline.forward(req, self._sglang_server_args)
+
+    def _extract_action_output(self, response, converted_obs):
+        action_output = getattr(response, "output", response)
+        if isinstance(action_output, list) and len(action_output) == 1:
+            action_output = action_output[0]
+        if isinstance(action_output, Batch) and hasattr(action_output, "action"):
+            action_output = action_output.action
+        if torch.is_tensor(action_output):
+            action_output = self.action_adapter.unapply(
+                Batch(normalized_action=action_output.detach().cpu().float()),
+                obs=converted_obs,
+            )
+        return self._as_numeric_action_array(action_output)
+
+    def _as_numeric_action_array(self, action_output: Any) -> np.ndarray:
+        if isinstance(action_output, Batch):
+            if hasattr(action_output, "action"):
+                action_output = action_output.action
+            elif hasattr(action_output, "act"):
+                action_output = self.action_adapter.actions_from_unapply(
+                    action_output.act
+                )
+        if isinstance(action_output, dict):
+            action_output = self.action_adapter.actions_from_unapply(action_output)
+        if torch.is_tensor(action_output):
+            action_output = action_output.detach().cpu().float().numpy()
+        if isinstance(action_output, list):
+            action_output = [
+                item.detach().cpu().float().numpy() if torch.is_tensor(item) else item
+                for item in action_output
+            ]
+        actions = np.asarray(action_output)
+        if actions.dtype == np.dtype("O") and actions.size == 1:
+            actions = np.asarray(actions.item())
+        if actions.dtype == np.dtype("O"):
+            raise TypeError(
+                "DreamZero sglang action output is not numeric. "
+                f"type={type(action_output)!r}, dtype={actions.dtype}, "
+                f"shape={actions.shape}"
+            )
+        return actions.astype(np.float32, copy=False)
 
     @staticmethod
     def _infer_batch_size(value: Any) -> int:
@@ -440,15 +563,11 @@ class DreamZeroSGLangRolloutWorker(MultiStepRolloutWorker):
     def _slice_batch_value(value: Any, index: int, batch_size: int) -> Any:
         if torch.is_tensor(value):
             return (
-                value[index : index + 1]
-                if value.shape[:1] == (batch_size,)
-                else value
+                value[index : index + 1] if value.shape[:1] == (batch_size,) else value
             )
         if isinstance(value, np.ndarray):
             return (
-                value[index : index + 1]
-                if value.shape[:1] == (batch_size,)
-                else value
+                value[index : index + 1] if value.shape[:1] == (batch_size,) else value
             )
         if isinstance(value, Mapping):
             return {
@@ -475,21 +594,14 @@ class DreamZeroSGLangRolloutWorker(MultiStepRolloutWorker):
             session_id=session_id,
             reset_session=reset_session,
         )
-        req = self.sglang_pipeline.forward(req, self._sglang_server_args)
+        response = self._forward_sglang_request(req)
         self._eval_predict_calls += 1
 
-        action_output = req.output
-        if isinstance(action_output, Batch) and hasattr(action_output, "action"):
-            action_output = action_output.action
-        elif isinstance(action_output, Batch) and hasattr(action_output, "act"):
-            action_output = self.action_adapter.actions_from_unapply(action_output.act)
-        if torch.is_tensor(action_output):
-            action_output = action_output.detach().cpu().float().numpy()
-        elif isinstance(action_output, dict):
-            action_output = self.action_adapter.actions_from_unapply(action_output)
-        actions = np.asarray(action_output)
+        actions = self._extract_action_output(response, converted_obs)
         batch_size = self._infer_batch_size(normalized_input)
-        normalized_action = getattr(req, "dreamzero_action_pred", None)
+        normalized_action = getattr(response, "dreamzero_action_pred", None)
+        if normalized_action is None and self._sglang_use_scheduler:
+            normalized_action = getattr(response, "output", None)
         for slot in range(batch_size):
             self._maybe_dump_rollout_debug(
                 slot=slot,
@@ -539,3 +651,9 @@ class DreamZeroSGLangRolloutWorker(MultiStepRolloutWorker):
 
     def reload_model(self):
         raise NotImplementedError("DreamZero sglang rollout worker does not offload.")
+
+    def shutdown_sglang_backend(self):
+        generator = getattr(self, "_sglang_generator", None)
+        if generator is not None:
+            generator.shutdown()
+            self._sglang_generator = None

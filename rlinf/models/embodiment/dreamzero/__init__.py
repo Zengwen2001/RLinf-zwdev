@@ -73,6 +73,87 @@ def _promote_scalar_params_to_1d(model):
         setattr(module, param_name, new_p)
 
 
+def _cfg_bool(cfg: DictConfig, key: str, default: bool = False) -> bool:
+    value = cfg.get(key, default)
+    if isinstance(value, str):
+        return value.lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _compile_once(fn, **kwargs):
+    if hasattr(fn, "_torchdynamo_orig_callable"):
+        return fn, False
+    return torch.compile(**kwargs)(fn), True
+
+
+def _compile_dreamzero_components(model, cfg: DictConfig) -> None:
+    """Compile selected DreamZero inference components without post_initialize()."""
+    if not _cfg_bool(cfg, "compile_components", True):
+        return
+
+    if not hasattr(model, "action_head"):
+        get_logger().warning(
+            "DreamZero compile_components requested but action_head is missing."
+        )
+        return
+
+    ah = model.action_head
+    compiled = []
+
+    if _cfg_bool(cfg, "compile_text_encoder", True) and hasattr(ah, "text_encoder"):
+        ah.text_encoder.forward, did_compile = _compile_once(
+            ah.text_encoder.forward,
+            mode="reduce-overhead",
+            fullgraph=True,
+            dynamic=False,
+        )
+        if did_compile:
+            compiled.append("text_encoder.forward")
+
+    image_visual = getattr(
+        getattr(getattr(ah, "image_encoder", None), "model", None), "visual", None
+    )
+    if _cfg_bool(cfg, "compile_image_encoder", True) and image_visual is not None:
+        image_visual.forward, did_compile = _compile_once(
+            image_visual.forward,
+            mode="reduce-overhead",
+            fullgraph=True,
+            dynamic=False,
+        )
+        if did_compile:
+            compiled.append("image_encoder.model.visual.forward")
+
+    vae_model = getattr(getattr(ah, "vae", None), "model", None)
+    if _cfg_bool(cfg, "compile_vae", True) and vae_model is not None:
+        vae_model.encode, did_compile = _compile_once(
+            vae_model.encode,
+            mode="reduce-overhead",
+            fullgraph=True,
+            dynamic=False,
+        )
+        if did_compile:
+            compiled.append("vae.model.encode")
+
+    dit_model = getattr(ah, "model", None)
+    if (
+        _cfg_bool(cfg, "compile_dit_forward_blocks", True)
+        and dit_model is not None
+        and hasattr(dit_model, "_forward_blocks")
+    ):
+        dit_model._forward_blocks, did_compile = _compile_once(
+            dit_model._forward_blocks,
+            mode="reduce-overhead",
+            fullgraph=True,
+        )
+        if did_compile:
+            compiled.append("model._forward_blocks")
+
+    get_logger().info(
+        "DreamZero compiled inference components: %s",
+        ", ".join(compiled) if compiled else "none",
+    )
+
+
 def get_model(cfg: DictConfig, torch_dtype=None):
     """Load DreamZero policy from checkpoint."""
 
@@ -201,5 +282,6 @@ def get_model(cfg: DictConfig, torch_dtype=None):
             ah.trt_context = None
     _promote_scalar_params_to_1d(model)
     model = model.to(dtype=torch_dtype)
+    _compile_dreamzero_components(model, cfg)
 
     return model

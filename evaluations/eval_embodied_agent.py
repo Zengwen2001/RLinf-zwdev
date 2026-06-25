@@ -73,8 +73,16 @@ def main(cfg) -> None:
         env=env_group,
     )
 
-    runner.init_workers()
-    runner.run()
+    try:
+        runner.init_workers()
+        runner.run()
+    finally:
+        try:
+            if hasattr(rollout_group, "shutdown_sglang_backend"):
+                rollout_group.shutdown_sglang_backend().wait()
+        finally:
+            rollout_group._close()
+            env_group._close()
 
 
 if __name__ == "__main__":
