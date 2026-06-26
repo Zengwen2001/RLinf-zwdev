@@ -205,6 +205,7 @@ class DreamZeroSGLangRolloutWorker(MultiStepRolloutWorker):
         http_port = int(sglang_cfg.get("port", 30000)) + port_offset
         scheduler_port = int(sglang_cfg.get("scheduler_port", 5555)) + port_offset
         master_port = int(sglang_cfg.get("master_port", 30005)) + port_offset
+        default_pipeline_config = DreamZeroPipelineConfig()
         pipeline_config = DreamZeroPipelineConfig(
             dreamzero_compile_components=bool(
                 sglang_cfg.get("compile_components", True)
@@ -215,6 +216,12 @@ class DreamZeroSGLangRolloutWorker(MultiStepRolloutWorker):
             embodiment_tag=str(model_cfg.embodiment_tag),
             action_horizon=int(model_cfg.action_horizon),
             num_inference_steps=num_inference_steps,
+            dynamic_cache_schedule=bool(
+                sglang_cfg.get(
+                    "dynamic_cache_schedule",
+                    default_pipeline_config.dynamic_cache_schedule,
+                )
+            ),
             num_frames=int(action_head_cfg.num_frames),
             synthetic_height=int(model_cfg.target_video_height),
             synthetic_width=int(model_cfg.target_video_width),
@@ -500,7 +507,9 @@ class DreamZeroSGLangRolloutWorker(MultiStepRolloutWorker):
             )
             error = getattr(response, "error", None)
             if error is not None:
-                raise RuntimeError(f"DreamZero sglang scheduler request failed: {error}")
+                raise RuntimeError(
+                    f"DreamZero sglang scheduler request failed: {error}"
+                )
             return response
         return self.sglang_pipeline.forward(req, self._sglang_server_args)
 
