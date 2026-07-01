@@ -14,8 +14,9 @@
 
 import asyncio
 import gc
+import time
 from collections import defaultdict
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import torch
@@ -35,6 +36,7 @@ from rlinf.envs.action_utils import prepare_actions
 from rlinf.envs.wrappers import RecordVideo
 from rlinf.scheduler import Channel, Cluster, Worker
 from rlinf.utils.comm_mapping import CommMapper
+from rlinf.utils.delay_sampler import DelaySampler
 from rlinf.utils.distributed import masked_stats, normalize_from_stats
 from rlinf.utils.metric_utils import compute_split_num
 from rlinf.utils.nested_dict_process import (
@@ -50,6 +52,8 @@ from rlinf.utils.utils import (
     preprocess_embodied_batch,
 )
 from rlinf.workers.env.history_manager import HistoryManager
+
+INTERACT_DELAY_METRIC_KEY = "interact_delay"
 
 
 class EnvWorker(Worker):
@@ -145,6 +149,16 @@ class EnvWorker(Worker):
         )
         if self.use_training_pipeline and self.enable_train:
             self._init_pipeline_params()
+
+        self.delay_sampler = DelaySampler.create(
+            self.cfg.env.get("delay_sampler", None)
+        )
+        self.train_num_envs_per_send = (
+            self.train_num_envs_per_stage if self.enable_train else 0
+        )
+        self.eval_num_envs_per_send = (
+            self.eval_num_envs_per_stage if self.enable_eval else 0
+        )
 
         if self.enable_train:
             self.train_prev_done: list[torch.Tensor] = [
@@ -851,22 +865,109 @@ class EnvWorker(Worker):
         for stage_id in range(self.stage_num):
             env_output: EnvOutput = env_outputs[stage_id]
             env_batch = env_output.to_dict()
-            self.send_to(
-                group_name=self.cfg.rollout.group_name,
-                channel=rollout_channel,
-                data={
+            self._send_to_rollout_with_delay_sync(
+                rollout_channel,
+                {
                     "obs": env_batch["obs"],
                     "final_obs": env_batch["final_obs"],
                 },
                 mode="train",
-                tag="rollout_results",
-                env_decoupled_mode=self.env_decoupled_mode,
             )
 
     def _bootstrap_and_send_train(self, rollout_channel: Channel) -> list[EnvOutput]:
         env_outputs = self.bootstrap_step()
         self._send_train_bootstrap(rollout_channel, env_outputs)
         return env_outputs
+
+    def _use_rank_interact_delay(self) -> bool:
+        return self.delay_sampler is not None
+
+    def _record_interact_delay_samples(
+        self,
+        env_metrics: dict[str, list[torch.Tensor]] | None,
+        delay_seconds_list: list[float],
+    ) -> None:
+        if env_metrics is None or not delay_seconds_list:
+            return
+        env_metrics[INTERACT_DELAY_METRIC_KEY].append(
+            torch.as_tensor(delay_seconds_list, dtype=torch.float32).reshape(-1).cpu()
+        )
+
+    async def _send_to_rollout_with_delay(
+        self,
+        rollout_channel: Channel,
+        data: dict[str, Any],
+        env_metrics: dict[str, list[torch.Tensor]] | None = None,
+        *,
+        mode: Literal["train", "eval"] = "train",
+        tag: str = "rollout_results",
+    ) -> None:
+        delay_seconds_list: list[float] = []
+        if self._use_rank_interact_delay():
+            delay_seconds = float(self.delay_sampler.sample(1)[0])
+            delay_seconds_list.append(delay_seconds)
+            if delay_seconds > 0.0:
+                await asyncio.sleep(delay_seconds)
+
+        self.send_to(
+            group_name=self.cfg.rollout.group_name,
+            channel=rollout_channel,
+            data=data,
+            mode=mode,
+            tag=tag,
+            env_decoupled_mode=self.env_decoupled_mode,
+        )
+        self._record_interact_delay_samples(
+            env_metrics=env_metrics,
+            delay_seconds_list=delay_seconds_list,
+        )
+
+    def _send_to_rollout_with_delay_sync(
+        self,
+        rollout_channel: Channel,
+        data: dict[str, Any],
+        env_metrics: dict[str, list[torch.Tensor]] | None = None,
+        *,
+        mode: Literal["train", "eval"] = "train",
+        tag: str = "rollout_results",
+    ) -> None:
+        delay_seconds_list: list[float] = []
+        if self._use_rank_interact_delay():
+            delay_seconds = float(self.delay_sampler.sample(1)[0])
+            delay_seconds_list.append(delay_seconds)
+            if delay_seconds > 0.0:
+                time.sleep(delay_seconds)
+
+        self.send_to(
+            group_name=self.cfg.rollout.group_name,
+            channel=rollout_channel,
+            data=data,
+            mode=mode,
+            tag=tag,
+            env_decoupled_mode=self.env_decoupled_mode,
+        )
+        self._record_interact_delay_samples(
+            env_metrics=env_metrics,
+            delay_seconds_list=delay_seconds_list,
+        )
+
+    async def _send_train_bootstrap_with_delay(
+        self,
+        rollout_channel: Channel,
+        env_outputs: list[EnvOutput],
+        env_metrics: dict[str, list[torch.Tensor]] | None,
+    ) -> None:
+        for stage_id in range(self.stage_num):
+            env_output: EnvOutput = env_outputs[stage_id]
+            env_batch = env_output.to_dict()
+            await self._send_to_rollout_with_delay(
+                rollout_channel,
+                {
+                    "obs": env_batch["obs"],
+                    "final_obs": env_batch["final_obs"],
+                },
+                env_metrics=env_metrics,
+            )
 
     def prefetch_train_bootstrap(self, rollout_channel: Channel) -> None:
         """Prepare and send the first env batch for the next training rollout."""
@@ -926,13 +1027,14 @@ class EnvWorker(Worker):
         env_metrics = defaultdict(list)
 
         for epoch in range(self.rollout_epoch):
-            env_outputs = self.bootstrap_step()
-            for stage_id in range(self.stage_num):
-                if epoch == 0 and self._prefetched_train_bootstrap is not None:
-                    env_outputs = self._prefetched_train_bootstrap
-                    self._prefetched_train_bootstrap = None
-                else:
-                    env_outputs = self._bootstrap_and_send_train(rollout_channel)
+            if epoch == 0 and self._prefetched_train_bootstrap is not None:
+                env_outputs = self._prefetched_train_bootstrap
+                self._prefetched_train_bootstrap = None
+            else:
+                env_outputs = self.bootstrap_step()
+                await self._send_train_bootstrap_with_delay(
+                    rollout_channel, env_outputs, env_metrics
+                )
 
             for chunk_step_idx in range(self.n_train_chunk_steps):
                 for stage_id in range(self.stage_num):
@@ -1007,16 +1109,13 @@ class EnvWorker(Worker):
                         rollout_result.actions, stage_id
                     )
                     env_batch = env_output.to_dict()
-                    self.send_to(
-                        group_name=self.cfg.rollout.group_name,
-                        channel=rollout_channel,
-                        data={
+                    await self._send_to_rollout_with_delay(
+                        rollout_channel,
+                        {
                             "obs": env_batch["obs"],
                             "final_obs": env_batch["final_obs"],
                         },
-                        mode="train",
-                        tag="rollout_results",
-                        env_decoupled_mode=self.env_decoupled_mode,
+                        env_metrics=env_metrics,
                     )
                     if self.collect_transitions:
                         next_obs = (
@@ -1157,16 +1256,14 @@ class EnvWorker(Worker):
                         ),
                     )
                     env_batch = env_output.to_dict()
-                    self.send_to(
-                        group_name=self.cfg.rollout.group_name,
-                        channel=rollout_channel,
-                        data={
+                    self._send_to_rollout_with_delay_sync(
+                        rollout_channel,
+                        {
                             "obs": env_batch["obs"],
                             "final_obs": env_batch["final_obs"],
                         },
+                        env_metrics=eval_metrics,
                         mode="eval",
-                        tag="rollout_results",
-                        env_decoupled_mode=self.env_decoupled_mode,
                     )
 
             for eval_step in range(self.n_eval_chunk_steps):
@@ -1207,16 +1304,14 @@ class EnvWorker(Worker):
                         if eval_step == self.n_eval_chunk_steps - 1:
                             continue
                     env_batch = env_output.to_dict()
-                    self.send_to(
-                        group_name=self.cfg.rollout.group_name,
-                        channel=rollout_channel,
-                        data={
+                    self._send_to_rollout_with_delay_sync(
+                        rollout_channel,
+                        {
                             "obs": env_batch["obs"],
                             "final_obs": env_batch["final_obs"],
                         },
+                        env_metrics=eval_metrics,
                         mode="eval",
-                        tag="rollout_results",
-                        env_decoupled_mode=self.env_decoupled_mode,
                     )
 
             self.finish_rollout(mode="eval")
