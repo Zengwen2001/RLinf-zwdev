@@ -129,6 +129,9 @@ class MultiStepRolloutWorker(Worker):
                 "rollout_results": [],
             }
         self.rollout_queue_size = self.cfg.rollout.get("rollout_queue_size", 0)
+        self.env_decoupled_recv_timeout_s = float(
+            self.cfg.rollout.get("env_decoupled_recv_timeout_s", 0.02)
+        )
 
     def init_worker(self):
         rollout_model_config = copy.deepcopy(self.model_cfg)
@@ -736,7 +739,7 @@ class MultiStepRolloutWorker(Worker):
                     batch_size=self.eval_batch_size,
                     merge_fn=self._merge_obs_batches,
                     infer_batch_size_fn=self._infer_env_batch_size,
-                    timeout_time=0.02,
+                    timeout_time=self.env_decoupled_recv_timeout_s,
                     recv_queue_size=self.rollout_queue_size,
                 )
                 actions, _ = self.predict(env_output["obs"], mode="eval")
