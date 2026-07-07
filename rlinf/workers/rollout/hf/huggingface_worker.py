@@ -15,6 +15,7 @@
 import asyncio
 import copy
 import gc
+import os
 import time
 from typing import Any, Callable, Literal, Optional
 
@@ -132,6 +133,32 @@ class MultiStepRolloutWorker(Worker):
         self.env_decoupled_recv_timeout_s = float(
             self.cfg.rollout.get("env_decoupled_recv_timeout_s", 0.02)
         )
+
+    def _use_delayed_per_env_receive(self) -> bool:
+        return self.cfg.env.get("delay_sampler", None) is not None
+
+    def _delay_debug_log(self, message: str) -> None:
+        if os.environ.get("RLINF_DELAY_DEBUG", "0") == "1":
+            print(
+                f"[RLINF_DELAY_DEBUG rollout rank={self._rank} pid={os.getpid()}] "
+                f"{message}",
+                flush=True,
+            )
+
+    def _delayed_per_env_recv_item_num(
+        self, batch_size: int, recv_queue_size: int
+    ) -> int:
+        if batch_size % self._world_size != 0:
+            raise ValueError(
+                "Delayed per-env receive expects batch_size to be divisible by "
+                f"rollout world size: batch_size={batch_size}, "
+                f"world_size={self._world_size}."
+            )
+
+        envs_per_rollout_worker = batch_size // self._world_size
+        if recv_queue_size > 0:
+            return min(recv_queue_size, envs_per_rollout_worker)
+        return envs_per_rollout_worker
 
     def init_worker(self):
         rollout_model_config = copy.deepcopy(self.model_cfg)
@@ -278,8 +305,7 @@ class MultiStepRolloutWorker(Worker):
 
         Returns:
 
-            A merged payload and its split sizes. If only one shard is received, the
-            current implementation returns that shard directly.
+            A merged payload and its split sizes.
         """
         from rlinf.scheduler.worker.routing import (
             env_decoupled_build_recv_plan,
@@ -299,6 +325,12 @@ class MultiStepRolloutWorker(Worker):
             route_key=route_key,
             batch_size=batch_size,
             recv_queue_size=recv_queue_size,
+        )
+        self._delay_debug_log(
+            "recv-plan "
+            f"tag={tag} batch_size={batch_size} timeout={timeout_time} "
+            f"recv_queue_size={recv_queue_size} entries={len(plan.entries)} "
+            f"keys={[entry.key for entry in plan.entries]}"
         )
 
         def _finalize(received_items: list[Any]):
@@ -323,11 +355,17 @@ class MultiStepRolloutWorker(Worker):
             split_sizes = [
                 get_batch_size(item, infer_batch_size_fn) for item in received_items
             ]
+            self._delay_debug_log(
+                "recv-finalize "
+                f"tag={tag} received={len(received_items)} "
+                f"split_sizes={split_sizes} "
+                f"batch_router={self.batch_router[tag]}"
+            )
 
             if merge_fn is not None:
                 return merge_fn(received_items), split_sizes
             if len(received_items) == 1:
-                return received_items[0]
+                return received_items[0], split_sizes
             return merge_batches(received_items), split_sizes
 
         timeout_time = timeout_time + time.time()
@@ -361,6 +399,109 @@ class MultiStepRolloutWorker(Worker):
                     get_item_num = get_item_num + 1
 
         return _finalize(received_items)
+
+    async def recv_delayed_env_shards_with_timeout(
+        self,
+        group_name: str,
+        channel: Any | None,
+        *,
+        route_key: Any = None,
+        tag: str | None = None,
+        batch_size: int | None = None,
+        merge_fn: Optional[Callable[[list[Any]], Any]] = None,
+        infer_batch_size_fn: Optional[Callable[[Any], int]] = None,
+        timeout_time: float = 0.02,
+        recv_queue_size: int = 0,
+    ):
+        """Receive rank-inner delayed env shards without changing rank routing."""
+        from rlinf.scheduler.worker.routing import (
+            build_send_key,
+            get_batch_size,
+            merge_batches,
+            validate_batch_size,
+        )
+
+        if channel is None:
+            raise ValueError("recv_delayed_env_shards_with_timeout requires channel.")
+        if batch_size is None:
+            raise ValueError("batch_size is required for delayed per-env receive.")
+
+        max_item_num = self._delayed_per_env_recv_item_num(
+            batch_size=batch_size,
+            recv_queue_size=recv_queue_size,
+        )
+        if max_item_num <= 0:
+            raise ValueError(
+                f"Invalid delayed per-env receive item count: {max_item_num}."
+            )
+
+        key = build_send_key(
+            src_group_name=group_name,
+            dst_group_name=self.worker_address.root_group_name,
+            src_rank=None,
+            dst_rank=None,
+            tag=tag,
+            route_key=route_key,
+        )
+        self._delay_debug_log(
+            "recv-env-shard-plan "
+            f"tag={tag} batch_size={batch_size} timeout={timeout_time} "
+            f"recv_queue_size={recv_queue_size} max_item_num={max_item_num} key={key}"
+        )
+
+        received_items = []
+        get_item = channel.get(key=key, async_op=True)
+        item = await get_item.async_wait()
+        received_items.append(item)
+        self._delay_debug_log(
+            "recv-env-shard-got "
+            f"idx=1/{max_item_num} batch_index={item.get('batch_index', None)}"
+        )
+
+        timeout_deadline = time.time() + timeout_time
+        while len(received_items) < max_item_num:
+            if time.time() >= timeout_deadline:
+                self._delay_debug_log(
+                    "recv-env-shard-timeout "
+                    f"got={len(received_items)} max_item_num={max_item_num}"
+                )
+                break
+            try:
+                item = channel.get_nowait(key=key)
+            except asyncio.QueueEmpty:
+                await asyncio.sleep(0.0001)
+                continue
+            received_items.append(item)
+            self._delay_debug_log(
+                "recv-env-shard-got "
+                f"idx={len(received_items)}/{max_item_num} "
+                f"batch_index={item.get('batch_index', None)}"
+            )
+
+        routes = []
+        payloads = []
+        for item in received_items:
+            route = item["batch_index"]
+            payload = item["batch"]
+            validate_batch_size(
+                data=payload,
+                expected_batch_size=1,
+                infer_batch_size_fn=infer_batch_size_fn,
+            )
+            routes.append(route)
+            payloads.append(payload)
+
+        split_sizes = [get_batch_size(item, infer_batch_size_fn) for item in payloads]
+        self._delay_debug_log(
+            "recv-env-shard-finalize "
+            f"tag={tag} received={len(payloads)} split_sizes={split_sizes} "
+            f"routes={routes}"
+        )
+        if merge_fn is not None:
+            return merge_fn(payloads), split_sizes, routes
+        if len(payloads) == 1:
+            return payloads[0], split_sizes, routes
+        return merge_batches(payloads), split_sizes, routes
 
     def send_to_recorded_batch_routes(
         self,
@@ -417,6 +558,11 @@ class MultiStepRolloutWorker(Worker):
             if split_fn is not None
             else split_batch(data, split_sizes)
         )
+        self._delay_debug_log(
+            "send-actions-start "
+            f"tag={tag} split_sizes={split_sizes} "
+            f"routes={self.batch_router[tag]}"
+        )
 
         works = []
         for i, payload in enumerate(payloads):
@@ -445,6 +591,11 @@ class MultiStepRolloutWorker(Worker):
                 tag=tag if mode is None else f"{mode}_{tag}",
                 route_key=route_key,
             )
+            self._delay_debug_log(
+                "send-action-shard "
+                f"idx={i + 1}/{len(payloads)} batch_index={batch_index} "
+                f"dst_rank={send_rank} key={key}"
+            )
             work = channel.put(
                 item=senditem,
                 key=key,
@@ -454,7 +605,83 @@ class MultiStepRolloutWorker(Worker):
 
         # clear the batch_router for the next send
         self.batch_router[tag] = []
-        return AsyncRouteWork(works, lambda _: None)
+
+        def _finalize_send(_: list[Any]) -> None:
+            self._delay_debug_log(
+                f"send-actions-done tag={tag} shards={len(payloads)}"
+            )
+            return None
+
+        return AsyncRouteWork(works, _finalize_send)
+
+    def send_to_delayed_env_shard_routes(
+        self,
+        group_name: str,
+        channel: Any | None,
+        data: Any,
+        *,
+        routes: list[str],
+        route_key: Any = None,
+        tag: str | None = None,
+        split_fn: Optional[Callable[[Any, list[int]], list[Any]]] = None,
+        split_sizes: list[int],
+    ):
+        """Send actions back to the rank-inner env shards received in one batch."""
+        from rlinf.scheduler.collective import AsyncRouteWork
+        from rlinf.scheduler.worker.routing import build_send_key, split_batch
+
+        if channel is None:
+            raise ValueError("send_to_delayed_env_shard_routes requires channel.")
+        if not routes:
+            raise ValueError("routes is empty.")
+        if len(routes) != len(split_sizes):
+            raise ValueError(f"{len(routes)=} should equal {len(split_sizes)=}.")
+
+        payloads = (
+            split_fn(data, split_sizes)
+            if split_fn is not None
+            else split_batch(data, split_sizes)
+        )
+        self._delay_debug_log(
+            "send-env-shard-actions-start "
+            f"tag={tag} split_sizes={split_sizes} routes={routes}"
+        )
+
+        works = []
+        for i, payload in enumerate(payloads):
+            batch_index = routes[i]
+            send_rank, _, mode, _ = _split_channel_message(batch_index)
+            senditem = {
+                "batch_index": batch_index,
+                "batch": payload,
+            }
+            key = build_send_key(
+                src_group_name=self.worker_address.root_group_name,
+                dst_group_name=group_name,
+                src_rank=None,
+                dst_rank=send_rank,
+                tag=tag if mode is None else f"{mode}_{tag}",
+                route_key=route_key,
+            )
+            self._delay_debug_log(
+                "send-env-shard-action "
+                f"idx={i + 1}/{len(payloads)} batch_index={batch_index} "
+                f"dst_rank={send_rank} key={key}"
+            )
+            work = channel.put(
+                item=senditem,
+                key=key,
+                async_op=True,
+            )
+            works.append(work)
+
+        def _finalize_send(_: list[Any]) -> None:
+            self._delay_debug_log(
+                f"send-env-shard-actions-done tag={tag} shards={len(payloads)}"
+            )
+            return None
+
+        return AsyncRouteWork(works, _finalize_send)
 
     async def recv_env_output(
         self,
@@ -729,29 +956,54 @@ class MultiStepRolloutWorker(Worker):
             self.reload_model()
         if self.env_decoupled_mode:
             while True:
-                (
-                    env_output,
-                    split_sizes,
-                ) = await self.recv_from_and_record_batch_routes_with_timeout(
-                    group_name=self.cfg.env.group_name,
-                    channel=input_channel,
-                    tag="rollout_results",
-                    batch_size=self.eval_batch_size,
-                    merge_fn=self._merge_obs_batches,
-                    infer_batch_size_fn=self._infer_env_batch_size,
-                    timeout_time=self.env_decoupled_recv_timeout_s,
-                    recv_queue_size=self.rollout_queue_size,
-                )
+                if self._use_delayed_per_env_receive():
+                    env_output, split_sizes, routes = (
+                        await self.recv_delayed_env_shards_with_timeout(
+                            group_name=self.cfg.env.group_name,
+                            channel=input_channel,
+                            tag="rollout_results",
+                            batch_size=self.eval_batch_size,
+                            merge_fn=self._merge_obs_batches,
+                            infer_batch_size_fn=self._infer_env_batch_size,
+                            timeout_time=self.env_decoupled_recv_timeout_s,
+                            recv_queue_size=self.rollout_queue_size,
+                        )
+                    )
+                else:
+                    env_output, split_sizes = (
+                        await self.recv_from_and_record_batch_routes_with_timeout(
+                            group_name=self.cfg.env.group_name,
+                            channel=input_channel,
+                            tag="rollout_results",
+                            batch_size=self.eval_batch_size,
+                            merge_fn=self._merge_obs_batches,
+                            infer_batch_size_fn=self._infer_env_batch_size,
+                            timeout_time=self.env_decoupled_recv_timeout_s,
+                            recv_queue_size=self.rollout_queue_size,
+                        )
+                    )
+                    routes = None
                 actions, _ = self.predict(env_output["obs"], mode="eval")
                 if isinstance(actions, torch.Tensor):
                     actions = actions.detach().cpu().contiguous()
-                self.send_to_recorded_batch_routes(
-                    group_name=self.cfg.env.group_name,
-                    channel=output_channel,
-                    data=actions,
-                    tag="rollout_results",
-                    split_sizes=split_sizes,
-                )
+                if routes is None:
+                    send_work = self.send_to_recorded_batch_routes(
+                        group_name=self.cfg.env.group_name,
+                        channel=output_channel,
+                        data=actions,
+                        tag="rollout_results",
+                        split_sizes=split_sizes,
+                    )
+                else:
+                    send_work = self.send_to_delayed_env_shard_routes(
+                        group_name=self.cfg.env.group_name,
+                        channel=output_channel,
+                        data=actions,
+                        routes=routes,
+                        tag="rollout_results",
+                        split_sizes=split_sizes,
+                    )
+                await send_work.async_wait()
         else:
             for _ in tqdm(
                 range(self.eval_rollout_epoch),

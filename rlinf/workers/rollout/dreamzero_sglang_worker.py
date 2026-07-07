@@ -25,6 +25,7 @@ import numpy as np
 import torch
 from omegaconf import DictConfig, open_dict
 from tianshou.data import Batch
+from tqdm import tqdm
 
 from rlinf.data.datasets.dreamzero.data_transforms import (
     build_dreamzero_composed_transform,
@@ -37,6 +38,14 @@ from rlinf.data.datasets.dreamzero.data_transforms import (
 )
 from rlinf.models.embodiment.dreamzero.dreamzero_policy import DreamZeroPolicy
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
+
+
+_DREAMZERO_ROLLOUT_METADATA_KEYS = (
+    "dreamzero_env_rank",
+    "dreamzero_local_env_id",
+    "dreamzero_episode_id",
+    "dreamzero_reset_mask",
+)
 
 
 class _DreamZeroActionAdapter:
@@ -136,18 +145,6 @@ class _DreamZeroActionAdapter:
 class DreamZeroSGLangRolloutWorker(MultiStepRolloutWorker):
     """Evaluation-only DreamZero rollout worker backed by sglang's in-process pipeline."""
 
-    @staticmethod
-    def _disable_groot_scheduler_compile() -> None:
-        from groot.vla.model.dreamzero.modules.flow_unipc_multistep_scheduler import (
-            FlowUniPCMultistepScheduler,
-        )
-
-        for name in ("multistep_uni_p_bh_update", "multistep_uni_c_bh_update"):
-            method = getattr(FlowUniPCMultistepScheduler, name)
-            original = getattr(method, "__wrapped__", None)
-            if original is not None:
-                setattr(FlowUniPCMultistepScheduler, name, original)
-
     def init_worker(self):
         if not self.only_eval:
             raise NotImplementedError(
@@ -190,9 +187,6 @@ class DreamZeroSGLangRolloutWorker(MultiStepRolloutWorker):
 
         action_head_cfg = model_cfg.action_head_cfg.config
         sglang_cfg = self.cfg.rollout.get("sglang", {})
-        if bool(sglang_cfg.get("disable_groot_scheduler_compile", True)):
-            os.environ["DREAMZERO_DISABLE_GROOT_SCHEDULER_COMPILE"] = "1"
-            self._disable_groot_scheduler_compile()
         tp_size = int(sglang_cfg.get("tp_size", 1))
         sp_size = int(sglang_cfg.get("sp_size", 1))
         cfg_parallel_degree = int(sglang_cfg.get("cfg_parallel_degree", 1))
@@ -385,12 +379,38 @@ class DreamZeroSGLangRolloutWorker(MultiStepRolloutWorker):
         self._eval_predict_calls = 0
         self._debug_dump_count = 0
         self._debug_sessions = bool(sglang_cfg.get("debug_sessions", False))
+        self._debug_batch_print = bool(
+            sglang_cfg.get("debug_batch", False)
+        ) or bool(int(os.environ.get("DREAMZERO_SGLANG_WORKER_DEBUG_BATCH", "0") or 0))
         self._seed = int(sglang_cfg.get("seed", 1140))
         self._chunks_per_episode = max(
             1,
             int(self.cfg.env.eval.max_episode_steps)
             // int(self.model_cfg.num_action_chunks),
         )
+
+    @staticmethod
+    def _debug_shape(value: Any) -> Any:
+        if torch.is_tensor(value):
+            return tuple(value.shape)
+        if isinstance(value, np.ndarray):
+            return value.shape
+        if isinstance(value, Mapping):
+            return {
+                key: DreamZeroSGLangRolloutWorker._debug_shape(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+            return f"{type(value).__name__}[{len(value)}]"
+        return type(value).__name__
+
+    def _debug_batch_log(self, message: str) -> None:
+        if self._debug_batch_print:
+            print(
+                f"[DreamZeroSGLangWorker batch-debug rank={self._rank} "
+                f"pid={os.getpid()} call={self._eval_predict_calls}] {message}",
+                flush=True,
+            )
 
     @staticmethod
     def _debug_to_cpu(value):
@@ -413,8 +433,8 @@ class DreamZeroSGLangRolloutWorker(MultiStepRolloutWorker):
         self,
         *,
         slot: int,
-        session_id: str,
-        reset_session: bool,
+        logical_session_id: str,
+        reset_mask: bool,
         normalized_input: dict[str, Any],
         converted_obs: dict[str, Any],
         normalized_action: Any,
@@ -438,8 +458,8 @@ class DreamZeroSGLangRolloutWorker(MultiStepRolloutWorker):
                 "pid": os.getpid(),
                 "call": self._debug_dump_count,
                 "slot": slot,
-                "session_id": session_id,
-                "reset_session": reset_session,
+                "logical_session_id": logical_session_id,
+                "reset_mask": reset_mask,
                 "converted_obs": self._debug_to_cpu(converted_obs),
                 "normalized_input": self._debug_to_cpu(normalized_input),
                 "normalized_action": self._debug_to_cpu(normalized_action),
@@ -449,25 +469,154 @@ class DreamZeroSGLangRolloutWorker(MultiStepRolloutWorker):
         )
         self._debug_dump_count += 1
 
-    def _session_id_for_batch(self) -> str:
-        return f"rlinf-eval-rank{self._rank}-batch"
+    @staticmethod
+    def _as_metadata_list(value: Any, batch_size: int, name: str) -> list[Any]:
+        if torch.is_tensor(value):
+            value = value.detach().cpu()
+            if value.ndim == 0:
+                values = [value.item()]
+            else:
+                values = value.flatten().tolist()
+        elif isinstance(value, np.ndarray):
+            if value.ndim == 0:
+                values = [value.item()]
+            else:
+                values = value.reshape(-1).tolist()
+        elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+            values = list(value)
+        else:
+            values = [value]
 
-    def _should_reset_session(self) -> bool:
-        return self._eval_predict_calls % self._chunks_per_episode == 0
+        if len(values) == 1 and batch_size > 1:
+            values = values * batch_size
+        if len(values) != batch_size:
+            raise ValueError(
+                f"DreamZero rollout metadata {name!r} has {len(values)} values, "
+                f"expected batch_size={batch_size}."
+            )
+        return values
+
+    def _split_rollout_metadata(
+        self, env_obs: Any
+    ) -> tuple[Any, dict[str, Any]]:
+        if not isinstance(env_obs, Mapping):
+            return env_obs, {}
+        metadata = {
+            key: env_obs[key]
+            for key in _DREAMZERO_ROLLOUT_METADATA_KEYS
+            if key in env_obs
+        }
+        if not metadata:
+            return env_obs, {}
+        cleaned = {
+            key: value
+            for key, value in env_obs.items()
+            if key not in _DREAMZERO_ROLLOUT_METADATA_KEYS
+        }
+        return cleaned, metadata
+
+    @staticmethod
+    def _merge_dreamzero_metadata_values(values: list[Any]) -> Any:
+        first_non_none = next((value for value in values if value is not None), None)
+        if first_non_none is None:
+            return None
+        if torch.is_tensor(first_non_none):
+            return torch.cat(values, dim=0)
+        if isinstance(first_non_none, np.ndarray):
+            return np.concatenate(values, axis=0)
+        if isinstance(first_non_none, list):
+            return [item for value in values for item in value]
+        return values
+
+    @staticmethod
+    def _merge_obs_batches(obs_batches: list[dict[str, Any]]) -> dict[str, Any]:
+        merged = MultiStepRolloutWorker._merge_obs_batches(obs_batches)
+        for key in _DREAMZERO_ROLLOUT_METADATA_KEYS:
+            values = [obs_batch.get(key, None) for obs_batch in obs_batches]
+            if any(value is not None for value in values):
+                merged[key] = (
+                    DreamZeroSGLangRolloutWorker._merge_dreamzero_metadata_values(
+                        values
+                    )
+                )
+        return merged
+
+    @staticmethod
+    def _obs_with_payload_metadata(env_output: dict[str, Any]) -> dict[str, Any]:
+        obs = env_output["obs"]
+        metadata = {
+            key: env_output[key]
+            for key in _DREAMZERO_ROLLOUT_METADATA_KEYS
+            if key in env_output
+        }
+        if not metadata:
+            return obs
+        if not isinstance(obs, Mapping):
+            raise TypeError(
+                "DreamZero sglang eval metadata requires dict observations, "
+                f"got {type(obs)!r}."
+            )
+        return {**obs, **metadata}
+
+    def _session_ids_for_batch(
+        self, batch_size: int, metadata: dict[str, Any]
+    ) -> list[str]:
+        missing = [
+            key
+            for key in ("dreamzero_env_rank", "dreamzero_local_env_id")
+            if key not in metadata
+        ]
+        if missing:
+            raise ValueError(
+                "DreamZero sglang eval requires env metadata for session cache: "
+                f"missing {missing}"
+            )
+        env_ranks = self._as_metadata_list(
+            metadata["dreamzero_env_rank"], batch_size, "dreamzero_env_rank"
+        )
+        local_env_ids = self._as_metadata_list(
+            metadata["dreamzero_local_env_id"],
+            batch_size,
+            "dreamzero_local_env_id",
+        )
+        session_ids = [
+            f"rlinf-eval-env{int(env_rank)}-slot{int(local_env_id)}"
+            for env_rank, local_env_id in zip(env_ranks, local_env_ids)
+        ]
+
+        if len(set(session_ids)) != len(session_ids):
+            raise ValueError(
+                "DreamZero sglang eval received duplicate session ids in one "
+                f"batch: {session_ids}"
+            )
+        return session_ids
+
+    def _reset_mask_for_batch(
+        self, batch_size: int, metadata: dict[str, Any]
+    ) -> list[bool]:
+        if "dreamzero_reset_mask" not in metadata:
+            raise ValueError(
+                "DreamZero sglang eval requires dreamzero_reset_mask for "
+                "session cache"
+            )
+        reset_values = self._as_metadata_list(
+            metadata["dreamzero_reset_mask"], batch_size, "dreamzero_reset_mask"
+        )
+        return [bool(value) for value in reset_values]
 
     def _active_session_count(self) -> int | None:
-        session_store = getattr(self.sglang_pipeline, "session_store", None)
-        if session_store is None:
+        cache_manager = getattr(self.sglang_pipeline, "cache_manager", None)
+        if cache_manager is None:
             return None
-        return session_store.get_active_count()
+        return cache_manager.get_active_count()
 
     def _build_request(
         self,
         normalized_input,
         original_obs,
         *,
-        session_id: str,
-        reset_session: bool,
+        session_ids: list[str],
+        reset_mask: list[bool],
     ):
         from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 
@@ -477,26 +626,26 @@ class DreamZeroSGLangRolloutWorker(MultiStepRolloutWorker):
             ),
             guidance_scale=float(self._sglang_server_args.pipeline_config.cfg_scale),
             seed=self._seed,
-            session_id=session_id,
-            reset_session=reset_session,
             embodiment_tag=self.action_adapter.embodiment_tag,
             action_horizon=int(self.model_cfg.action_horizon),
             relative_action_per_horizon=bool(
                 self.model_cfg.get("relative_action_per_horizon", False)
             ),
         )
+        extra = {
+            "dreamzero_normalized_input": normalized_input,
+            "dreamzero_original_obs": original_obs,
+            "dreamzero_session_ids": session_ids,
+            "dreamzero_reset_mask": reset_mask,
+        }
         return Req(
             sampling_params=sampling_params,
-            extra={
-                "dreamzero_normalized_input": normalized_input,
-                "dreamzero_original_obs": original_obs,
-                "dreamzero_session_id": session_id,
-                "dreamzero_reset_session": reset_session,
-            },
+            extra=extra,
             suppress_logs=True,
         )
 
     def _forward_sglang_request(self, req):
+        self._debug_batch_log("enter sglang forward")
         if self._sglang_use_scheduler:
             # DiffGenerator.generate() performs image/video prompt parsing and
             # file output handling. DreamZero rollout already builds a Req with
@@ -510,8 +659,17 @@ class DreamZeroSGLangRolloutWorker(MultiStepRolloutWorker):
                 raise RuntimeError(
                     f"DreamZero sglang scheduler request failed: {error}"
                 )
+            self._debug_batch_log(
+                "exit scheduler forward output_shape="
+                f"{self._debug_shape(getattr(response, 'output', response))}"
+            )
             return response
-        return self.sglang_pipeline.forward(req, self._sglang_server_args)
+        response = self.sglang_pipeline.forward(req, self._sglang_server_args)
+        self._debug_batch_log(
+            "exit in-process forward output_shape="
+            f"{self._debug_shape(getattr(response, 'output', response))}"
+        )
+        return response
 
     def _extract_action_output(self, response, converted_obs):
         action_output = getattr(response, "output", response)
@@ -594,28 +752,35 @@ class DreamZeroSGLangRolloutWorker(MultiStepRolloutWorker):
         self,
         normalized_input: dict[str, Any],
         converted_obs: dict[str, Any],
+        session_metadata: dict[str, Any],
     ) -> np.ndarray:
-        session_id = self._session_id_for_batch()
-        reset_session = self._should_reset_session()
+        batch_size = self._infer_batch_size(normalized_input)
+        session_ids = self._session_ids_for_batch(batch_size, session_metadata)
+        reset_mask = self._reset_mask_for_batch(batch_size, session_metadata)
+        self._debug_batch_log(
+            f"build req batch_size={batch_size} reset_count={sum(reset_mask)} "
+            f"session_ids={session_ids[:4]} "
+            f"input_shapes={self._debug_shape(normalized_input)}"
+        )
         req = self._build_request(
             normalized_input,
             converted_obs,
-            session_id=session_id,
-            reset_session=reset_session,
+            session_ids=session_ids,
+            reset_mask=reset_mask,
         )
         response = self._forward_sglang_request(req)
         self._eval_predict_calls += 1
 
         actions = self._extract_action_output(response, converted_obs)
-        batch_size = self._infer_batch_size(normalized_input)
+        self._debug_batch_log(f"actions_shape={self._debug_shape(actions)}")
         normalized_action = getattr(response, "dreamzero_action_pred", None)
         if normalized_action is None and self._sglang_use_scheduler:
             normalized_action = getattr(response, "output", None)
         for slot in range(batch_size):
             self._maybe_dump_rollout_debug(
                 slot=slot,
-                session_id=session_id,
-                reset_session=reset_session,
+                logical_session_id=session_ids[slot],
+                reset_mask=reset_mask[slot],
                 normalized_input=self._slice_batch_value(
                     normalized_input, slot, batch_size
                 ),
@@ -633,10 +798,18 @@ class DreamZeroSGLangRolloutWorker(MultiStepRolloutWorker):
                 "DreamZero sglang rollout worker currently supports eval only."
             )
 
-        converted_obs = self.action_adapter.observation_convert(env_obs)
+        rollout_env_obs, session_metadata = self._split_rollout_metadata(env_obs)
+        converted_obs = self.action_adapter.observation_convert(rollout_env_obs)
+        self._debug_batch_log(
+            f"predict received env_obs_shape={self._debug_shape(env_obs)} "
+            f"metadata_shape={self._debug_shape(session_metadata)} "
+            f"converted_shape={self._debug_shape(converted_obs)}"
+        )
         normalized_input = self.action_adapter.normalize_obs(converted_obs)
         active_before = self._active_session_count()
-        actions = self._run_batch_request(normalized_input, converted_obs)
+        actions = self._run_batch_request(
+            normalized_input, converted_obs, session_metadata
+        )
         if self._debug_sessions:
             self.log_info(
                 "DreamZero sglang session "
@@ -654,6 +827,89 @@ class DreamZeroSGLangRolloutWorker(MultiStepRolloutWorker):
             "forward_inputs": {"action": flat.cpu()},
         }
         return actions, result
+
+    async def evaluate(self, input_channel, output_channel):
+        if self.enable_offload:
+            self.reload_model()
+        if self.env_decoupled_mode:
+            while True:
+                if self._use_delayed_per_env_receive():
+                    env_output, split_sizes, routes = (
+                        await self.recv_delayed_env_shards_with_timeout(
+                            group_name=self.cfg.env.group_name,
+                            channel=input_channel,
+                            tag="rollout_results",
+                            batch_size=self.eval_batch_size,
+                            merge_fn=self._merge_obs_batches,
+                            infer_batch_size_fn=self._infer_env_batch_size,
+                            timeout_time=self.env_decoupled_recv_timeout_s,
+                            recv_queue_size=self.rollout_queue_size,
+                        )
+                    )
+                else:
+                    env_output, split_sizes = (
+                        await self.recv_from_and_record_batch_routes_with_timeout(
+                            group_name=self.cfg.env.group_name,
+                            channel=input_channel,
+                            tag="rollout_results",
+                            batch_size=self.eval_batch_size,
+                            merge_fn=self._merge_obs_batches,
+                            infer_batch_size_fn=self._infer_env_batch_size,
+                            timeout_time=self.env_decoupled_recv_timeout_s,
+                            recv_queue_size=self.rollout_queue_size,
+                        )
+                    )
+                    routes = None
+                actions, _ = self.predict(
+                    self._obs_with_payload_metadata(env_output), mode="eval"
+                )
+                if isinstance(actions, torch.Tensor):
+                    actions = actions.detach().cpu().contiguous()
+                if routes is None:
+                    send_work = self.send_to_recorded_batch_routes(
+                        group_name=self.cfg.env.group_name,
+                        channel=output_channel,
+                        data=actions,
+                        tag="rollout_results",
+                        split_sizes=split_sizes,
+                    )
+                else:
+                    send_work = self.send_to_delayed_env_shard_routes(
+                        group_name=self.cfg.env.group_name,
+                        channel=output_channel,
+                        data=actions,
+                        routes=routes,
+                        tag="rollout_results",
+                        split_sizes=split_sizes,
+                    )
+                await send_work.async_wait()
+        else:
+            for _ in tqdm(
+                range(self.eval_rollout_epoch),
+                desc="Evaluating Rollout Epochs",
+                disable=(self._rank != 0),
+            ):
+                for _ in range(self.n_eval_chunk_steps):
+                    for _ in range(self.num_pipeline_stages):
+                        env_output = await self.recv_env_output(
+                            input_channel=input_channel,
+                            tag="eval_rollout_results",
+                            batch_size=self.eval_batch_size,
+                        )
+                        actions, _ = self.predict(
+                            self._obs_with_payload_metadata(env_output), mode="eval"
+                        )
+                        if isinstance(actions, torch.Tensor):
+                            actions = actions.detach().cpu().contiguous()
+                        self.send_rollout_result(
+                            output_channel=output_channel,
+                            rollout_result=actions,
+                            tag="eval_rollout_results",
+                            batch_size=self.eval_batch_size,
+                        )
+
+            if self.enable_offload:
+                self.offload_model()
 
     def offload_model(self):
         raise NotImplementedError("DreamZero sglang rollout worker does not offload.")

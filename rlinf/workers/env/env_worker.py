@@ -14,9 +14,10 @@
 
 import asyncio
 import gc
+import os
 import time
 from collections import defaultdict
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import numpy as np
 import torch
@@ -42,11 +43,14 @@ from rlinf.utils.metric_utils import compute_split_num
 from rlinf.utils.nested_dict_process import (
     clone_nested_to_cpu,
     copy_dict_tensor,
+    split_dict,
     split_dict_to_chunk,
     update_nested_cfg,
 )
 from rlinf.utils.placement import HybridComponentPlacement
 from rlinf.utils.utils import (
+    _build_channel_message,
+    _split_channel_message,
     flatten_embodied_batch,
     pack_batch,
     preprocess_embodied_batch,
@@ -170,6 +174,10 @@ class EnvWorker(Worker):
                 torch.zeros(self.eval_num_envs_per_stage, dtype=torch.bool)
                 for _ in range(self.stage_num)
             ]
+            self.eval_dreamzero_episode_ids: list[torch.Tensor] = [
+                torch.zeros(self.eval_num_envs_per_stage, dtype=torch.long)
+                for _ in range(self.stage_num)
+            ]
         self.env_decoupled_mode = self.cfg.runner.get("enable_decoupled_mode", False)
 
         if self.env_decoupled_mode:
@@ -181,6 +189,29 @@ class EnvWorker(Worker):
             ) >= self._component_placement.get_world_size("rollout"), (
                 "the world size of env must be greater than the world size of rollout in env_decoupled_mode"
             )
+
+    def _dreamzero_eval_session_metadata(
+        self,
+        *,
+        stage_id: int,
+        reset_mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        reset_mask = reset_mask.detach().cpu().to(torch.bool)
+        batch_size = int(reset_mask.numel())
+        local_env_ids = torch.arange(batch_size, dtype=torch.long)
+        if self.stage_num > 1:
+            local_env_ids = local_env_ids + stage_id * self.eval_num_envs_per_stage
+
+        return {
+            "dreamzero_env_rank": torch.full(
+                (batch_size,), int(self._rank), dtype=torch.long
+            ),
+            "dreamzero_local_env_id": local_env_ids,
+            "dreamzero_episode_id": self.eval_dreamzero_episode_ids[
+                stage_id
+            ].detach().cpu(),
+            "dreamzero_reset_mask": reset_mask,
+        }
 
     def init_worker(self):
         # This is a barrier to ensure all envs' initial setup upon import is done
@@ -525,10 +556,12 @@ class EnvWorker(Worker):
             elif "episode" in infos:
                 for key in infos["episode"]:
                     env_info[key] = infos["episode"][key][newly_done].cpu()
+            self.eval_dreamzero_episode_ids[stage_id][newly_done.cpu()] += 1
 
         env_output = EnvOutput(
             obs=extracted_obs,
             final_obs=final_obs,
+            env_infos={"dreamzero_reset_mask": newly_done},
         )
         return env_output, env_info
 
@@ -879,8 +912,23 @@ class EnvWorker(Worker):
         self._send_train_bootstrap(rollout_channel, env_outputs)
         return env_outputs
 
-    def _use_rank_interact_delay(self) -> bool:
-        return self.delay_sampler is not None
+    def _use_delayed_per_env_send(self) -> bool:
+        return self.delay_sampler is not None and self.env_decoupled_mode
+
+    def _delay_debug_log(self, message: str) -> None:
+        if os.environ.get("RLINF_DELAY_DEBUG", "0") == "1":
+            print(
+                f"[RLINF_DELAY_DEBUG env rank={self._rank} pid={os.getpid()}] "
+                f"{message}",
+                flush=True,
+            )
+
+    def _num_envs_per_send(self, mode: Literal["train", "eval"]) -> int:
+        return (
+            self.train_num_envs_per_send
+            if mode == "train"
+            else self.eval_num_envs_per_send
+        )
 
     def _record_interact_delay_samples(
         self,
@@ -893,6 +941,146 @@ class EnvWorker(Worker):
             torch.as_tensor(delay_seconds_list, dtype=torch.float32).reshape(-1).cpu()
         )
 
+    def _send_env_batch_shard_to_rollout(
+        self,
+        rollout_channel: Channel,
+        data: dict[str, Any],
+        *,
+        batch_idx: int,
+        mode: Literal["train", "eval"],
+        tag: str,
+    ) -> None:
+        from rlinf.scheduler.worker.routing import build_send_key
+
+        key = build_send_key(
+            src_group_name=self.worker_address.root_group_name,
+            dst_group_name=self.cfg.rollout.group_name,
+            src_rank=None,
+            dst_rank=None,
+            tag=tag,
+        )
+        self._delay_debug_log(
+            "send-obs-shard "
+            f"mode={mode} tag={tag} batch_idx={batch_idx} key={key}"
+        )
+        rollout_channel.put(
+            item={
+                "batch_index": _build_channel_message(
+                    self._rank,
+                    batch_idx,
+                    mode,
+                    tag,
+                ),
+                "batch": data,
+            },
+            key=key,
+        )
+
+    async def _sleep_and_send_env_batch_shard_to_rollout(
+        self,
+        rollout_channel: Channel,
+        data: dict[str, Any],
+        delay_seconds: float,
+        *,
+        batch_idx: int,
+        mode: Literal["train", "eval"],
+        tag: str,
+    ) -> None:
+        if delay_seconds > 0.0:
+            await asyncio.sleep(delay_seconds)
+        self._send_env_batch_shard_to_rollout(
+            rollout_channel,
+            data,
+            batch_idx=batch_idx,
+            mode=mode,
+            tag=tag,
+        )
+
+    def _split_env_send_batch(self, data: dict[str, Any], mode: Literal["train", "eval"]):
+        num_envs = self._num_envs_per_send(mode)
+        if num_envs <= 0:
+            raise ValueError(f"No envs configured for {mode} delayed send.")
+        return split_dict(data, [1 for _ in range(num_envs)])
+
+    def _recv_from_rollout_with_delay(
+        self,
+        *,
+        channel: Channel,
+        tag: str,
+        batch_size: int,
+        mode: Literal["train", "eval"],
+        merge_fn: Callable[[list[Any]], Any] | None = None,
+        infer_batch_size_fn: Callable[[Any], int] | None = None,
+    ) -> Any:
+        if not self._use_delayed_per_env_send():
+            return self.recv_from(
+                group_name=self.cfg.rollout.group_name,
+                channel=channel,
+                tag=tag,
+                batch_size=batch_size,
+                merge_fn=merge_fn,
+                infer_batch_size_fn=infer_batch_size_fn,
+                env_decoupled_mode=self.env_decoupled_mode,
+            )
+
+        from rlinf.scheduler.worker.routing import (
+            build_send_key,
+            merge_batches,
+            validate_batch_size,
+        )
+
+        num_envs = self._num_envs_per_send(mode)
+        if num_envs <= 0:
+            raise ValueError(f"No envs configured for {mode} delayed recv.")
+
+        key = build_send_key(
+            src_group_name=self.cfg.rollout.group_name,
+            dst_group_name=self.worker_address.root_group_name,
+            src_rank=None,
+            dst_rank=self._rank,
+            tag=tag,
+        )
+        self._delay_debug_log(
+            f"recv-action-start mode={mode} tag={tag} num_envs={num_envs} key={key}"
+        )
+        received_items = []
+        for recv_idx in range(num_envs):
+            self._delay_debug_log(
+                f"recv-action-wait idx={recv_idx + 1}/{num_envs} key={key}"
+            )
+            item = channel.get(key=key)
+            self._delay_debug_log(
+                "recv-action-got "
+                f"idx={recv_idx + 1}/{num_envs} "
+                f"batch_index={item.get('batch_index', None)}"
+            )
+            received_items.append(item)
+
+        sorted_items = []
+        for item in received_items:
+            batch_index = item["batch_index"]
+            _, batch_idx, _, _ = _split_channel_message(batch_index)
+            payload = item["batch"]
+            validate_batch_size(
+                data=payload,
+                expected_batch_size=1,
+                infer_batch_size_fn=infer_batch_size_fn,
+            )
+            sorted_items.append((batch_idx, payload))
+        sorted_items.sort(key=lambda x: x[0])
+
+        payloads = [payload for _, payload in sorted_items]
+        merged = merge_fn(payloads) if merge_fn is not None else merge_batches(payloads)
+        validate_batch_size(
+            data=merged,
+            expected_batch_size=num_envs,
+            infer_batch_size_fn=infer_batch_size_fn,
+        )
+        self._delay_debug_log(
+            f"recv-action-done mode={mode} tag={tag} received={len(received_items)}"
+        )
+        return merged
+
     async def _send_to_rollout_with_delay(
         self,
         rollout_channel: Channel,
@@ -902,24 +1090,48 @@ class EnvWorker(Worker):
         mode: Literal["train", "eval"] = "train",
         tag: str = "rollout_results",
     ) -> None:
-        delay_seconds_list: list[float] = []
-        if self._use_rank_interact_delay():
-            delay_seconds = float(self.delay_sampler.sample(1)[0])
-            delay_seconds_list.append(delay_seconds)
-            if delay_seconds > 0.0:
-                await asyncio.sleep(delay_seconds)
+        if not self._use_delayed_per_env_send():
+            self.send_to(
+                group_name=self.cfg.rollout.group_name,
+                channel=rollout_channel,
+                data=data,
+                mode=mode,
+                tag=tag,
+                env_decoupled_mode=self.env_decoupled_mode,
+            )
+            return
 
-        self.send_to(
-            group_name=self.cfg.rollout.group_name,
-            channel=rollout_channel,
-            data=data,
-            mode=mode,
-            tag=tag,
-            env_decoupled_mode=self.env_decoupled_mode,
+        env_batches = self._split_env_send_batch(data, mode)
+        delay_seconds_list = [
+            float(delay_seconds)
+            for delay_seconds in self.delay_sampler.sample(len(env_batches))
+        ]
+        self._delay_debug_log(
+            "send-obs-async-start "
+            f"mode={mode} tag={tag} shards={len(env_batches)} "
+            f"delays={[round(delay, 4) for delay in delay_seconds_list]}"
+        )
+        await asyncio.gather(
+            *[
+                self._sleep_and_send_env_batch_shard_to_rollout(
+                    rollout_channel,
+                    env_batch,
+                    delay_seconds,
+                    batch_idx=batch_idx,
+                    mode=mode,
+                    tag=tag,
+                )
+                for batch_idx, (env_batch, delay_seconds) in enumerate(
+                    zip(env_batches, delay_seconds_list, strict=True)
+                )
+            ]
         )
         self._record_interact_delay_samples(
             env_metrics=env_metrics,
             delay_seconds_list=delay_seconds_list,
+        )
+        self._delay_debug_log(
+            f"send-obs-async-done mode={mode} tag={tag} shards={len(env_batches)}"
         )
 
     def _send_to_rollout_with_delay_sync(
@@ -931,24 +1143,49 @@ class EnvWorker(Worker):
         mode: Literal["train", "eval"] = "train",
         tag: str = "rollout_results",
     ) -> None:
-        delay_seconds_list: list[float] = []
-        if self._use_rank_interact_delay():
-            delay_seconds = float(self.delay_sampler.sample(1)[0])
-            delay_seconds_list.append(delay_seconds)
-            if delay_seconds > 0.0:
-                time.sleep(delay_seconds)
+        if not self._use_delayed_per_env_send():
+            self.send_to(
+                group_name=self.cfg.rollout.group_name,
+                channel=rollout_channel,
+                data=data,
+                mode=mode,
+                tag=tag,
+                env_decoupled_mode=self.env_decoupled_mode,
+            )
+            return
 
-        self.send_to(
-            group_name=self.cfg.rollout.group_name,
-            channel=rollout_channel,
-            data=data,
-            mode=mode,
-            tag=tag,
-            env_decoupled_mode=self.env_decoupled_mode,
+        env_batches = self._split_env_send_batch(data, mode)
+        delay_seconds_list = [
+            float(delay_seconds)
+            for delay_seconds in self.delay_sampler.sample(len(env_batches))
+        ]
+        self._delay_debug_log(
+            "send-obs-sync-start "
+            f"mode={mode} tag={tag} shards={len(env_batches)} "
+            f"delays={[round(delay, 4) for delay in delay_seconds_list]}"
         )
+        start_time = time.monotonic()
+        delayed_batches = sorted(
+            enumerate(zip(env_batches, delay_seconds_list, strict=True)),
+            key=lambda item: item[1][1],
+        )
+        for batch_idx, (env_batch, delay_seconds) in delayed_batches:
+            remaining = delay_seconds - (time.monotonic() - start_time)
+            if remaining > 0.0:
+                time.sleep(remaining)
+            self._send_env_batch_shard_to_rollout(
+                rollout_channel,
+                env_batch,
+                batch_idx=batch_idx,
+                mode=mode,
+                tag=tag,
+            )
         self._record_interact_delay_samples(
             env_metrics=env_metrics,
             delay_seconds_list=delay_seconds_list,
+        )
+        self._delay_debug_log(
+            f"send-obs-sync-done mode={mode} tag={tag} shards={len(env_batches)}"
         )
 
     async def _send_train_bootstrap_with_delay(
@@ -1062,14 +1299,13 @@ class EnvWorker(Worker):
                                 reward_model_output.detach().float().reshape(-1).cpu()
                             )
 
-                    rollout_result = self.recv_from(
-                        group_name=self.cfg.rollout.group_name,
+                    rollout_result = self._recv_from_rollout_with_delay(
                         channel=input_channel,
                         tag="train_rollout_results",
                         batch_size=self.train_batch_size,
+                        mode="train",
                         merge_fn=RolloutResult.merge_rollout_results,
                         infer_batch_size_fn=self._infer_rollout_batch_size,
-                        env_decoupled_mode=self.env_decoupled_mode,
                     )
                     rewards = self.compute_bootstrap_rewards(
                         env_output, rollout_result.bootstrap_values, reward_model_output
@@ -1157,14 +1393,13 @@ class EnvWorker(Worker):
                         env_metrics["reward_model_output"].append(
                             reward_model_output.detach().float().reshape(-1).cpu()
                         )
-                rollout_result = self.recv_from(
-                    group_name=self.cfg.rollout.group_name,
+                rollout_result = self._recv_from_rollout_with_delay(
                     channel=input_channel,
                     tag="train_rollout_results",
                     batch_size=self.train_batch_size,
+                    mode="train",
                     merge_fn=RolloutResult.merge_rollout_results,
                     infer_batch_size_fn=self._infer_rollout_batch_size,
-                    env_decoupled_mode=self.env_decoupled_mode,
                 )
                 rewards = self.compute_bootstrap_rewards(
                     env_output, rollout_result.bootstrap_values, reward_model_output
@@ -1246,7 +1481,13 @@ class EnvWorker(Worker):
                     self.eval_prev_done[stage_id] = torch.zeros(
                         self.eval_num_envs_per_stage, dtype=torch.bool
                     )
+                    self.eval_dreamzero_episode_ids[stage_id] = torch.zeros(
+                        self.eval_num_envs_per_stage, dtype=torch.long
+                    )
                     extracted_obs, infos = self.eval_env_list[stage_id].reset()
+                    reset_mask = torch.ones(
+                        self.eval_num_envs_per_stage, dtype=torch.bool
+                    )
                     env_output = EnvOutput(
                         obs=extracted_obs,
                         final_obs=(
@@ -1261,6 +1502,10 @@ class EnvWorker(Worker):
                         {
                             "obs": env_batch["obs"],
                             "final_obs": env_batch["final_obs"],
+                            **self._dreamzero_eval_session_metadata(
+                                stage_id=stage_id,
+                                reset_mask=reset_mask,
+                            ),
                         },
                         env_metrics=eval_metrics,
                         mode="eval",
@@ -1268,15 +1513,14 @@ class EnvWorker(Worker):
 
             for eval_step in range(self.n_eval_chunk_steps):
                 for stage_id in range(self.stage_num):
-                    rollout_results = self.recv_from(
-                        group_name=self.cfg.rollout.group_name,
+                    rollout_results = self._recv_from_rollout_with_delay(
                         channel=input_channel,
                         tag="eval_rollout_results",
                         batch_size=self.eval_batch_size,
+                        mode="eval",
                         infer_batch_size_fn=self._infer_rollout_batch_size
                         if self.env_decoupled_mode
                         else None,
-                        env_decoupled_mode=self.env_decoupled_mode,
                     )
                     raw_chunk_actions = (
                         rollout_results.actions
@@ -1304,11 +1548,16 @@ class EnvWorker(Worker):
                         if eval_step == self.n_eval_chunk_steps - 1:
                             continue
                     env_batch = env_output.to_dict()
+                    reset_mask = env_output.env_infos["dreamzero_reset_mask"]
                     self._send_to_rollout_with_delay_sync(
                         rollout_channel,
                         {
                             "obs": env_batch["obs"],
                             "final_obs": env_batch["final_obs"],
+                            **self._dreamzero_eval_session_metadata(
+                                stage_id=stage_id,
+                                reset_mask=reset_mask,
+                            ),
                         },
                         env_metrics=eval_metrics,
                         mode="eval",

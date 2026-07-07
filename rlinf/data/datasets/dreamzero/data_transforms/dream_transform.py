@@ -62,6 +62,23 @@ def concat_multiview_video(embodiment_tag: Any, images: Any) -> np.ndarray:
 class DreamTransform(DreamTransformBase):
     """DreamTransform that delegates multi-view layout to ``data_transforms`` registry."""
 
+    @staticmethod
+    def _is_string_list(value: Any) -> bool:
+        return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+    @staticmethod
+    def _slice_batch_leaf(data: Any, index: int, batch_size: int) -> Any:
+        if isinstance(data, dict):
+            return {
+                key: DreamTransform._slice_batch_leaf(value, index, batch_size)
+                for key, value in data.items()
+            }
+        if isinstance(data, str):
+            return data
+        if DreamTransform._is_string_list(data):
+            return data[index] if len(data) == batch_size else data
+        return data[index]
+
     def apply_single(self, data: dict) -> dict:
         """Apply transform for one sample.
 
@@ -173,14 +190,13 @@ class DreamTransform(DreamTransformBase):
 
     def apply_batch(self, data: dict, batch_size: int) -> dict:
         """Collate with RLinf prompt wrapping (supports all registered embodiments)."""
-        import tree
-
         from rlinf.data.datasets.dreamzero.dataloader import DreamZeroCollator
 
         data.pop("lapa_action", None)
         data.pop("dream_actions", None)
         data_split = [
-            tree.map_structure(lambda x: x[i], data) for i in range(batch_size)
+            self._slice_batch_leaf(data, index, batch_size)
+            for index in range(batch_size)
         ]
         data_split_processed = [self.apply_single(elem) for elem in data_split]
         return DreamZeroCollator.collate_batch(
