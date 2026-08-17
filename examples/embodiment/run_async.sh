@@ -29,7 +29,28 @@ else
 fi
 
 # NOTE: Set the active robot platform (required for correct action dimension and normalization), supported platforms are LIBERO, ALOHA, BRIDGE, default is LIBERO
-ROBOT_PLATFORM=${2:-${ROBOT_PLATFORM:-"LIBERO"}}
+ROBOT_PLATFORM=${ROBOT_PLATFORM:-"LIBERO"}
+PROFILE_UTIL=0
+EXTRA_CLI_OVERRIDES=""
+ROBOT_PLATFORM_SET=0
+for ARG in "${@:2}"; do
+    case "$ARG" in
+        profile-util|--profile-util)
+            PROFILE_UTIL=1
+            ;;
+        *=*|+*)
+            EXTRA_CLI_OVERRIDES+=" $ARG"
+            ;;
+        *)
+            if [ "$ROBOT_PLATFORM_SET" -eq 0 ]; then
+                ROBOT_PLATFORM=$ARG
+                ROBOT_PLATFORM_SET=1
+            else
+                EXTRA_CLI_OVERRIDES+=" $ARG"
+            fi
+            ;;
+    esac
+done
 
 export ROBOT_PLATFORM
 echo "Using ROBOT_PLATFORM=$ROBOT_PLATFORM"
@@ -38,6 +59,14 @@ echo "Using Python at $(which python)"
 LOG_DIR="${REPO_PATH}/logs/$(date +'%Y%m%d-%H:%M:%S')-${CONFIG_NAME}" #/$(date +'%Y%m%d-%H:%M:%S')"
 MEGA_LOG_FILE="${LOG_DIR}/run_embodiment.log"
 mkdir -p "${LOG_DIR}"
-CMD="python ${SRC_FILE} --config-path ${EMBODIED_PATH}/config/ --config-name ${CONFIG_NAME} runner.logger.log_path=${LOG_DIR}"
+CMD="python ${SRC_FILE} --config-path ${EMBODIED_PATH}/config/ --config-name ${CONFIG_NAME} runner.logger.log_path=${LOG_DIR}${EXTRA_CLI_OVERRIDES}"
 echo ${CMD} > ${MEGA_LOG_FILE}
-${CMD} 2>&1 | tee -a ${MEGA_LOG_FILE}
+if [ "$PROFILE_UTIL" -eq 1 ]; then
+    UTIL_OUTPUT_DIR="${LOG_DIR}/hardware_util"
+    UTIL_INTERVAL=${UTIL_PROFILE_INTERVAL:-1.0}
+    PROFILE_CMD="python ${REPO_PATH}/toolkits/hardware_monitor/record_utilization.py -o ${UTIL_OUTPUT_DIR} -i ${UTIL_INTERVAL} --title ${CONFIG_NAME}_hardware_util -- ${CMD}"
+    echo ${PROFILE_CMD} >> ${MEGA_LOG_FILE}
+    ${PROFILE_CMD} 2>&1 | tee -a ${MEGA_LOG_FILE}
+else
+    ${CMD} 2>&1 | tee -a ${MEGA_LOG_FILE}
+fi
