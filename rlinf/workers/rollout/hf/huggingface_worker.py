@@ -33,6 +33,7 @@ from rlinf.data.schema.embodied_types import PolicyOutput
 from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
+from rlinf.profiling import ProfileStage, profile_range
 from rlinf.scheduler import Channel, Cluster, Worker, split_channel_message
 from rlinf.utils.placement import HybridComponentPlacement
 
@@ -593,19 +594,25 @@ class MultiStepRolloutWorker(Worker):
                 dtype=torch.bool,
                 device=actions.device,
             )
-        return PolicyOutput(
-            actions=actions,
-            prev_logprobs=result["prev_logprobs"] if self.collect_prev_infos else None,
-            prev_values=result["prev_values"] if self.collect_prev_infos else None,
-            bootstrap_values=self.get_bootstrap_values(final_obs),
-            intervene_flags=intervene_flags,
-            forward_inputs=result["forward_inputs"],
-            versions=torch.full_like(
-                result["prev_logprobs"],
-                float(self.version),
-                dtype=torch.float32,
-            ),
-        )
+        bootstrap_values = self.get_bootstrap_values(final_obs)
+        with profile_range(ProfileStage.ROLLOUT_POSTPROCESS):
+            return PolicyOutput(
+                actions=actions,
+                prev_logprobs=(
+                    result["prev_logprobs"] if self.collect_prev_infos else None
+                ),
+                prev_values=(
+                    result["prev_values"] if self.collect_prev_infos else None
+                ),
+                bootstrap_values=bootstrap_values,
+                intervene_flags=intervene_flags,
+                forward_inputs=result["forward_inputs"],
+                versions=torch.full_like(
+                    result["prev_logprobs"],
+                    float(self.version),
+                    dtype=torch.float32,
+                ),
+            )
 
     def get_bootstrap_values(
         self, final_obs: dict[str, Any] | None
@@ -617,7 +624,8 @@ class MultiStepRolloutWorker(Worker):
         ):
             return None
         with torch.no_grad():
-            actions, result = self._predict_rollout_actions(final_obs)
+            with profile_range(ProfileStage.ROLLOUT_BOOTSTRAP_VALUE):
+                actions, result = self._predict_rollout_actions(final_obs)
             if "prev_values" in result and result["prev_values"] is not None:
                 final_values = result["prev_values"]
             else:
@@ -660,7 +668,8 @@ class MultiStepRolloutWorker(Worker):
                 send=send_func,
             )
 
-        applied_version = await self.weight_syncer.apply(self.hf_model, recv_func)
+        with profile_range(ProfileStage.WEIGHT_SYNC_ROLLOUT_APPLY):
+            applied_version = await self.weight_syncer.apply(self.hf_model, recv_func)
         self.version = applied_version
         if self.finished_episodes is None:
             self.finished_episodes = (
@@ -677,16 +686,17 @@ class MultiStepRolloutWorker(Worker):
         self.update_dagger_beta()
         for _ in range(self.n_train_chunk_steps):
             for stage_id in range(self.num_pipeline_stages):
-                env_output = await self.recv_from(
-                    group_name=self.cfg.env.group_name,
-                    channel=input_channel,
-                    tag="train_rollout_results",
-                    route_key=stage_id,
-                    async_op=True,
-                    batch_size=self.train_batch_size,
-                    merge_fn=self._merge_obs_batches,
-                    infer_batch_size_fn=self._infer_env_batch_size,
-                ).async_wait()
+                with profile_range(ProfileStage.ROLLOUT_RECV_OBS):
+                    env_output = await self.recv_from(
+                        group_name=self.cfg.env.group_name,
+                        channel=input_channel,
+                        tag="train_rollout_results",
+                        route_key=stage_id,
+                        async_op=True,
+                        batch_size=self.train_batch_size,
+                        merge_fn=self._merge_obs_batches,
+                        infer_batch_size_fn=self._infer_env_batch_size,
+                    ).async_wait()
                 actions, result = self._predict_rollout_actions(
                     env_output["obs"],
                     final_obs=env_output.get("final_obs", None),
@@ -699,27 +709,29 @@ class MultiStepRolloutWorker(Worker):
                     result,
                     final_obs=env_output.get("final_obs", None),
                 )
-                self.send_to(
+                with profile_range(ProfileStage.ROLLOUT_SEND_ACTION):
+                    self.send_to(
+                        group_name=self.cfg.env.group_name,
+                        channel=output_channel,
+                        data=policy_output,
+                        tag="train_rollout_results",
+                        route_key=stage_id,
+                        async_op=True,
+                        batch_size=self.train_batch_size,
+                        split_fn=self._split_policy_output,
+                    )
+        for stage_id in range(self.num_pipeline_stages):
+            with profile_range(ProfileStage.ROLLOUT_RECV_OBS):
+                env_output = await self.recv_from(
                     group_name=self.cfg.env.group_name,
-                    channel=output_channel,
-                    data=policy_output,
+                    channel=input_channel,
                     tag="train_rollout_results",
                     route_key=stage_id,
                     async_op=True,
                     batch_size=self.train_batch_size,
-                    split_fn=self._split_policy_output,
-                )
-        for stage_id in range(self.num_pipeline_stages):
-            env_output = await self.recv_from(
-                group_name=self.cfg.env.group_name,
-                channel=input_channel,
-                tag="train_rollout_results",
-                route_key=stage_id,
-                async_op=True,
-                batch_size=self.train_batch_size,
-                merge_fn=self._merge_obs_batches,
-                infer_batch_size_fn=self._infer_env_batch_size,
-            ).async_wait()
+                    merge_fn=self._merge_obs_batches,
+                    infer_batch_size_fn=self._infer_env_batch_size,
+                ).async_wait()
             actions, result = self._predict_rollout_actions(
                 env_output["obs"],
                 final_obs=env_output.get("final_obs", None),
@@ -735,30 +747,33 @@ class MultiStepRolloutWorker(Worker):
                     final_obs=env_output.get("final_obs", None),
                 )
             else:
-                policy_output = PolicyOutput(
-                    actions=actions,
-                    prev_values=(
-                        result["prev_values"] if self.collect_prev_infos else None
-                    ),
-                    bootstrap_values=self.get_bootstrap_values(
-                        env_output.get("final_obs", None)
-                    ),
-                    forward_inputs=(
-                        result["forward_inputs"]
-                        if self.rlt_feature_model is not None
-                        else {}
-                    ),
+                bootstrap_values = self.get_bootstrap_values(
+                    env_output.get("final_obs", None)
                 )
-            self.send_to(
-                group_name=self.cfg.env.group_name,
-                channel=output_channel,
-                data=policy_output,
-                tag="train_rollout_results",
-                route_key=stage_id,
-                async_op=True,
-                batch_size=self.train_batch_size,
-                split_fn=self._split_policy_output,
-            )
+                with profile_range(ProfileStage.ROLLOUT_POSTPROCESS):
+                    policy_output = PolicyOutput(
+                        actions=actions,
+                        prev_values=(
+                            result["prev_values"] if self.collect_prev_infos else None
+                        ),
+                        bootstrap_values=bootstrap_values,
+                        forward_inputs=(
+                            result["forward_inputs"]
+                            if self.rlt_feature_model is not None
+                            else {}
+                        ),
+                    )
+            with profile_range(ProfileStage.ROLLOUT_SEND_ACTION):
+                self.send_to(
+                    group_name=self.cfg.env.group_name,
+                    channel=output_channel,
+                    data=policy_output,
+                    tag="train_rollout_results",
+                    route_key=stage_id,
+                    async_op=True,
+                    batch_size=self.train_batch_size,
+                    split_fn=self._split_policy_output,
+                )
 
     @Worker.timer("rollout/generate")
     async def generate(

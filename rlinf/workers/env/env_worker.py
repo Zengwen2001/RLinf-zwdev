@@ -38,6 +38,7 @@ from rlinf.envs import get_env_cls
 from rlinf.envs.action_utils import prepare_actions
 from rlinf.envs.utils import get_env_attr
 from rlinf.envs.wrappers import RecordVideo
+from rlinf.profiling import ProfileStage, profile_range
 from rlinf.scheduler import Channel, Cluster, CommMapper, Worker
 from rlinf.utils.data_iter_utils import split_list
 from rlinf.utils.distributed import masked_stats, normalize_from_stats
@@ -940,15 +941,16 @@ class EnvWorker(Worker):
         for stage_id in range(self.stage_num):
             env_output: EnvOutput = env_outputs[stage_id]
             env_batch = env_output.to_dict()
-            self.send_to(
-                group_name=self.cfg.rollout.group_name,
-                channel=rollout_channel,
-                data=self._build_rollout_input_data(env_batch),
-                mode="train",
-                tag="rollout_results",
-                route_key=stage_id if not self.env_decoupled_mode else None,
-                decoupled_mode=self.env_decoupled_mode,
-            )
+            with profile_range(ProfileStage.ENV_SEND_OBS):
+                self.send_to(
+                    group_name=self.cfg.rollout.group_name,
+                    channel=rollout_channel,
+                    data=self._build_rollout_input_data(env_batch),
+                    mode="train",
+                    tag="rollout_results",
+                    route_key=stage_id if not self.env_decoupled_mode else None,
+                    decoupled_mode=self.env_decoupled_mode,
+                )
 
     def _bootstrap_and_send_train(self, rollout_channel: Channel) -> list[EnvOutput]:
         env_outputs = self.bootstrap_step()
@@ -1062,91 +1064,104 @@ class EnvWorker(Worker):
                                 reward_model_output.detach().float().reshape(-1).cpu()
                             )
 
-                    policy_output = self.recv_from(
-                        group_name=self.cfg.rollout.group_name,
-                        channel=input_channel,
-                        tag="train_rollout_results",
-                        route_key=stage_id if not self.env_decoupled_mode else None,
-                        batch_size=self.train_batch_size,
-                        merge_fn=PolicyOutput.merge,
-                        infer_batch_size_fn=self._infer_rollout_batch_size,
-                        decoupled_mode=self.env_decoupled_mode,
-                    )
-                    rewards = self.compute_bootstrap_rewards(
-                        env_output, policy_output.bootstrap_values, reward_model_output
-                    )
-                    chunk_step_result = ChunkStepResult(
-                        actions=policy_output.forward_inputs.get("action", None),
-                        prev_logprobs=(
-                            policy_output.prev_logprobs
-                            if self.collect_prev_infos
-                            else None
-                        ),
-                        prev_values=(
-                            policy_output.prev_values
-                            if self.collect_prev_infos
-                            else None
-                        ),
-                        forward_inputs=policy_output.forward_inputs,
-                        versions=policy_output.versions,
-                        dones=env_output.dones,
-                        truncations=env_output.truncations,
-                        terminations=env_output.terminations,
-                        rewards=rewards,
-                    )
-
-                    self.trajectory_builders[stage_id].append_step_result(
-                        chunk_step_result
-                    )
-                    if (
-                        self.reward_mode == "history_buffer"
-                        and self.history_reward_assign
-                        and reward_model_output is not None
-                    ):
-                        self.assign_history_reward(stage_id, reward_model_output)
-                    if policy_output.intervene_flags is not None:
-                        self.trajectory_builders[
-                            stage_id
-                        ].mark_last_step_with_intervene_flags(
-                            policy_output.intervene_flags
+                    with profile_range(ProfileStage.ENV_RECV_ACTION):
+                        policy_output = self.recv_from(
+                            group_name=self.cfg.rollout.group_name,
+                            channel=input_channel,
+                            tag="train_rollout_results",
+                            route_key=(
+                                stage_id if not self.env_decoupled_mode else None
+                            ),
+                            batch_size=self.train_batch_size,
+                            merge_fn=PolicyOutput.merge,
+                            infer_batch_size_fn=self._infer_rollout_batch_size,
+                            decoupled_mode=self.env_decoupled_mode,
                         )
-                    if self.enable_rlt and self.collect_transitions:
-                        update_rlt_transitions(
-                            stage_id,
-                            rlt_pending_obs,
-                            self.trajectory_builders,
-                            policy_output,
-                            cache_current=True,
+                    with profile_range(ProfileStage.ENV_BOOTSTRAP_REWARD):
+                        rewards = self.compute_bootstrap_rewards(
+                            env_output,
+                            policy_output.bootstrap_values,
+                            reward_model_output,
+                        )
+                    with profile_range(ProfileStage.ENV_TRAJECTORY_APPEND):
+                        chunk_step_result = ChunkStepResult(
+                            actions=policy_output.forward_inputs.get("action", None),
+                            prev_logprobs=(
+                                policy_output.prev_logprobs
+                                if self.collect_prev_infos
+                                else None
+                            ),
+                            prev_values=(
+                                policy_output.prev_values
+                                if self.collect_prev_infos
+                                else None
+                            ),
+                            forward_inputs=policy_output.forward_inputs,
+                            versions=policy_output.versions,
+                            dones=env_output.dones,
+                            truncations=env_output.truncations,
+                            terminations=env_output.terminations,
+                            rewards=rewards,
                         )
 
-                    env_output, env_info, chunk_step_payload = self.env_interact_step(
-                        policy_output.actions, stage_id
-                    )
+                        self.trajectory_builders[stage_id].append_step_result(
+                            chunk_step_result
+                        )
+                        if (
+                            self.reward_mode == "history_buffer"
+                            and self.history_reward_assign
+                            and reward_model_output is not None
+                        ):
+                            self.assign_history_reward(stage_id, reward_model_output)
+                        if policy_output.intervene_flags is not None:
+                            self.trajectory_builders[
+                                stage_id
+                            ].mark_last_step_with_intervene_flags(
+                                policy_output.intervene_flags
+                            )
+                        if self.enable_rlt and self.collect_transitions:
+                            update_rlt_transitions(
+                                stage_id,
+                                rlt_pending_obs,
+                                self.trajectory_builders,
+                                policy_output,
+                                cache_current=True,
+                            )
+
+                    with profile_range(ProfileStage.ENV_STEP):
+                        env_output, env_info, chunk_step_payload = (
+                            self.env_interact_step(policy_output.actions, stage_id)
+                        )
                     stage_builder = self.trajectory_builders[stage_id]
                     if isinstance(stage_builder, EmbodiedLerobotTrajectoryBuilder):
-                        stage_builder.append_chunk_episode_data(
-                            policy_output=policy_output,
-                            **chunk_step_payload,
-                        )
+                        with profile_range(ProfileStage.ENV_TRAJECTORY_APPEND):
+                            stage_builder.append_chunk_episode_data(
+                                policy_output=policy_output,
+                                **chunk_step_payload,
+                            )
                     env_batch = env_output.to_dict()
-                    self.send_to(
-                        group_name=self.cfg.rollout.group_name,
-                        channel=rollout_channel,
-                        data=self._build_rollout_input_data(env_batch),
-                        mode="train",
-                        tag="rollout_results",
-                        route_key=stage_id if not self.env_decoupled_mode else None,
-                        decoupled_mode=self.env_decoupled_mode,
-                    )
+                    with profile_range(ProfileStage.ENV_SEND_OBS):
+                        self.send_to(
+                            group_name=self.cfg.rollout.group_name,
+                            channel=rollout_channel,
+                            data=self._build_rollout_input_data(env_batch),
+                            mode="train",
+                            tag="rollout_results",
+                            route_key=(
+                                stage_id if not self.env_decoupled_mode else None
+                            ),
+                            decoupled_mode=self.env_decoupled_mode,
+                        )
                     if self.collect_transitions and not self.enable_rlt:
                         next_obs = (
                             env_output.final_obs
                             if env_output.dones.any() and self.cfg.env.train.auto_reset
                             else env_output.obs
                         )
-                        self.trajectory_builders[stage_id].append_transitions(
-                            curr_obs, next_obs
-                        )
+                        with profile_range(ProfileStage.ENV_TRAJECTORY_APPEND):
+                            self.trajectory_builders[stage_id].append_transitions(
+                                curr_obs, next_obs
+                            )
 
                     env_outputs[stage_id] = env_output
                     should_record = (
@@ -1179,58 +1194,69 @@ class EnvWorker(Worker):
                         env_metrics["reward_model_output"].append(
                             reward_model_output.detach().float().reshape(-1).cpu()
                         )
-                policy_output = self.recv_from(
-                    group_name=self.cfg.rollout.group_name,
-                    channel=input_channel,
-                    tag="train_rollout_results",
-                    route_key=stage_id if not self.env_decoupled_mode else None,
-                    batch_size=self.train_batch_size,
-                    merge_fn=PolicyOutput.merge,
-                    infer_batch_size_fn=self._infer_rollout_batch_size,
-                    decoupled_mode=self.env_decoupled_mode,
-                )
-                rewards = self.compute_bootstrap_rewards(
-                    env_output, policy_output.bootstrap_values, reward_model_output
-                )
-                final_actions = policy_output.forward_inputs.get("action", None)
-                final_forward_inputs = policy_output.forward_inputs
-                if (
-                    OmegaConf.select(self.cfg, "algorithm.loss_type", default="")
-                    == "embodied_dagger"
-                ):
-                    final_actions = None
-                    final_forward_inputs = {}
-
-                chunk_step_result = ChunkStepResult(
-                    actions=final_actions,
-                    prev_logprobs=(
-                        policy_output.prev_logprobs if self.collect_prev_infos else None
-                    ),
-                    prev_values=(
-                        policy_output.prev_values if self.collect_prev_infos else None
-                    ),
-                    forward_inputs=final_forward_inputs,
-                    versions=policy_output.versions,
-                    dones=env_output.dones,
-                    truncations=env_output.truncations,
-                    terminations=env_output.terminations,
-                    rewards=rewards,
-                )
-                self.trajectory_builders[stage_id].append_step_result(chunk_step_result)
-                if (
-                    self.reward_mode == "history_buffer"
-                    and self.history_reward_assign
-                    and reward_model_output is not None
-                ):
-                    self.assign_history_reward(stage_id, reward_model_output)
-                if self.enable_rlt and self.collect_transitions:
-                    update_rlt_transitions(
-                        stage_id,
-                        rlt_pending_obs,
-                        self.trajectory_builders,
-                        policy_output,
-                        cache_current=False,
+                with profile_range(ProfileStage.ENV_RECV_ACTION):
+                    policy_output = self.recv_from(
+                        group_name=self.cfg.rollout.group_name,
+                        channel=input_channel,
+                        tag="train_rollout_results",
+                        route_key=stage_id if not self.env_decoupled_mode else None,
+                        batch_size=self.train_batch_size,
+                        merge_fn=PolicyOutput.merge,
+                        infer_batch_size_fn=self._infer_rollout_batch_size,
+                        decoupled_mode=self.env_decoupled_mode,
                     )
+                with profile_range(ProfileStage.ENV_BOOTSTRAP_REWARD):
+                    rewards = self.compute_bootstrap_rewards(
+                        env_output,
+                        policy_output.bootstrap_values,
+                        reward_model_output,
+                    )
+                with profile_range(ProfileStage.ENV_TRAJECTORY_APPEND):
+                    final_actions = policy_output.forward_inputs.get("action", None)
+                    final_forward_inputs = policy_output.forward_inputs
+                    if (
+                        OmegaConf.select(self.cfg, "algorithm.loss_type", default="")
+                        == "embodied_dagger"
+                    ):
+                        final_actions = None
+                        final_forward_inputs = {}
+
+                    chunk_step_result = ChunkStepResult(
+                        actions=final_actions,
+                        prev_logprobs=(
+                            policy_output.prev_logprobs
+                            if self.collect_prev_infos
+                            else None
+                        ),
+                        prev_values=(
+                            policy_output.prev_values
+                            if self.collect_prev_infos
+                            else None
+                        ),
+                        forward_inputs=final_forward_inputs,
+                        versions=policy_output.versions,
+                        dones=env_output.dones,
+                        truncations=env_output.truncations,
+                        terminations=env_output.terminations,
+                        rewards=rewards,
+                    )
+                    self.trajectory_builders[stage_id].append_step_result(
+                        chunk_step_result
+                    )
+                    if (
+                        self.reward_mode == "history_buffer"
+                        and self.history_reward_assign
+                        and reward_model_output is not None
+                    ):
+                        self.assign_history_reward(stage_id, reward_model_output)
+                    if self.enable_rlt and self.collect_transitions:
+                        update_rlt_transitions(
+                            stage_id,
+                            rlt_pending_obs,
+                            self.trajectory_builders,
+                            policy_output,
+                            cache_current=False,
+                        )
 
             if self.use_training_pipeline and actor_channel is not None:
                 await self.send_rollout_trajectories_pipeline(

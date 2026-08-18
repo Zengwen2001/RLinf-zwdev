@@ -37,6 +37,7 @@ from rlinf.models.embodiment.openpi.rtc_guidance import (
 from rlinf.models.embodiment.openpi.rtc_guidance import (
     sample_actions_with_rtc_guidance as _sample_actions_with_rtc_guidance,
 )
+from rlinf.profiling import ProfileStage, profile_range
 from rlinf.utils.logging import get_logger
 from rlinf.utils.nested_dict_process import copy_dict_tensor
 from rlinf.utils.pytree import register_pytree_dataclasses
@@ -847,14 +848,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         rtc_context: RTCGuidanceContext | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        to_process_obs = self.obs_processor(env_obs)  # env obs -> policy input obs
-        processed_obs = self.input_transform(
-            to_process_obs, transpose=False
-        )  # policy input obs -> model input obs
-        processed_obs = self.precision_processor(
-            processed_obs
-        )  # obs precision processor
-        observation = _model.Observation.from_dict(processed_obs)
+        with profile_range(ProfileStage.ROLLOUT_OBS_PREPROCESS):
+            to_process_obs = self.obs_processor(env_obs)
+            processed_obs = self.input_transform(to_process_obs, transpose=False)
+            processed_obs = self.precision_processor(processed_obs)
+            observation = _model.Observation.from_dict(processed_obs)
 
         is_dsrl_active = self.config.use_dsrl
         if is_dsrl_active:
@@ -876,9 +874,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             )
 
             # Step 3: Extract actual actions for environment interaction
-            real_actions = self.output_transform(
-                {"actions": outputs["actions"], "state": observation.state}
-            )["actions"]
+            with profile_range(ProfileStage.ROLLOUT_POSTPROCESS):
+                real_actions = self.output_transform(
+                    {"actions": outputs["actions"], "state": observation.state}
+                )["actions"]
 
             # Return actual actions to environment, but forward_inputs stores noise.
             actions = real_actions
@@ -902,9 +901,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 outputs = self.sample_actions(
                     observation, mode=mode, compute_values=compute_values
                 )
-            actions = self.output_transform(
-                {"actions": outputs["actions"], "state": observation.state}
-            )["actions"]
+            with profile_range(ProfileStage.ROLLOUT_POSTPROCESS):
+                actions = self.output_transform(
+                    {"actions": outputs["actions"], "state": observation.state}
+                )["actions"]
             prev_logprobs = outputs["prev_logprobs"]
             prev_values = outputs["prev_values"]
             forward_action = None
@@ -986,13 +986,15 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             # DSRL: SAC provides noise, convert dtype to match action_in_proj
             noise = noise.to(self.action_in_proj.weight.dtype)
 
-        images, img_masks, lang_tokens, lang_masks, state = (
-            self._preprocess_observation(observation, train=False)
-        )
+        with profile_range(ProfileStage.ROLLOUT_OBS_PREPROCESS):
+            images, img_masks, lang_tokens, lang_masks, state = (
+                self._preprocess_observation(observation, train=False)
+            )
 
-        prefix_output, prefix_pad_masks, past_key_values = self._build_prefix_cache(
-            images, img_masks, lang_tokens, lang_masks
-        )
+        with profile_range(ProfileStage.ROLLOUT_VLM_PREFIX):
+            prefix_output, prefix_pad_masks, past_key_values = self._build_prefix_cache(
+                images, img_masks, lang_tokens, lang_masks
+            )
 
         return self._sample_actions_with_prefix_cache(
             state,
@@ -1063,60 +1065,59 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         # collect nft states for nft algorithm
         nft_state = self._init_nft_state(collect_nft_state, x_t, num_steps, device)
 
-        # denoise step
-        for idx in range(num_steps):
-            # sample mean var val
-            if idx == denoise_inds[0][idx]:
-                sample_method = self.config.noise_method
-            else:
-                sample_method = "flow_ode"
-            x_t_prev = x_t
-            x_t_mean, x_t_std, value_t, v_t = self.sample_mean_var_val(
-                x_t,
-                idx,
-                state,
-                prefix_pad_masks,
-                past_key_values,
-                sample_method,
-                num_steps,
-                compute_values,
-            )
-            # Euler step - use new tensor assignment instead of in-place operation
-            x_t = x_t_mean + self.sample_noise(x_t.shape, device) * x_t_std
-            self._update_nft_state(nft_state, idx, x_t_prev, v_t, x_t, sample_method)
-            log_prob = self.get_logprob_norm(x_t, x_t_mean, x_t_std)
-            # store
-            values.append(value_t)
-            chains.append(x_t)
-            log_probs.append(log_prob)
-        x_0 = x_t
-        chains = torch.stack(chains, dim=1)
-        # post process for logprob
-        log_probs = torch.stack(log_probs, dim=1)[
-            :, :, : self.config.action_chunk, : self.config.action_env_dim
-        ]
-        if self.config.joint_logprob:
-            log_probs = log_probs.mean(dim=1)
-        else:
-            log_probs = log_probs[
-                torch.arange(log_probs.shape[0], device=device),
-                denoise_inds[:, 0],
+        with profile_range(ProfileStage.ROLLOUT_AE_DENOISE):
+            for idx in range(num_steps):
+                if idx == denoise_inds[0][idx]:
+                    sample_method = self.config.noise_method
+                else:
+                    sample_method = "flow_ode"
+                x_t_prev = x_t
+                x_t_mean, x_t_std, value_t, v_t = self.sample_mean_var_val(
+                    x_t,
+                    idx,
+                    state,
+                    prefix_pad_masks,
+                    past_key_values,
+                    sample_method,
+                    num_steps,
+                    compute_values,
+                )
+                x_t = x_t_mean + self.sample_noise(x_t.shape, device) * x_t_std
+                self._update_nft_state(
+                    nft_state, idx, x_t_prev, v_t, x_t, sample_method
+                )
+                log_prob = self.get_logprob_norm(x_t, x_t_mean, x_t_std)
+                values.append(value_t)
+                chains.append(x_t)
+                log_probs.append(log_prob)
+
+        with profile_range(ProfileStage.ROLLOUT_POSTPROCESS):
+            x_0 = x_t
+            chains = torch.stack(chains, dim=1)
+            log_probs = torch.stack(log_probs, dim=1)[
+                :, :, : self.config.action_chunk, : self.config.action_env_dim
             ]
-        # post process for value
-        if self.use_vlm_value:
-            values = values_vlm[:, None]
-        else:
-            values = torch.stack(values, dim=1).mean(dim=-1, keepdim=True)
-        result = {
-            "actions": x_0,
-            "chains": chains,
-            "prev_logprobs": log_probs,
-            "prev_values": values,
-            "denoise_inds": denoise_inds,
-        }
-        if collect_nft_state:
-            result.update(nft_state)
-            result["nft_x0"] = x_0.detach()
+            if self.config.joint_logprob:
+                log_probs = log_probs.mean(dim=1)
+            else:
+                log_probs = log_probs[
+                    torch.arange(log_probs.shape[0], device=device),
+                    denoise_inds[:, 0],
+                ]
+            if self.use_vlm_value:
+                values = values_vlm[:, None]
+            else:
+                values = torch.stack(values, dim=1).mean(dim=-1, keepdim=True)
+            result = {
+                "actions": x_0,
+                "chains": chains,
+                "prev_logprobs": log_probs,
+                "prev_values": values,
+                "denoise_inds": denoise_inds,
+            }
+            if collect_nft_state:
+                result.update(nft_state)
+                result["nft_x0"] = x_0.detach()
         return result
 
     def _get_timesteps(self, denoise_steps, device):

@@ -1375,13 +1375,15 @@ class Worker(metaclass=WorkerMeta):
 
         return decorator
 
-    def start_profile(self, step_idx: int) -> None:
+    def start_profile(self, step_idx: int) -> tuple[int, int]:
         """Open a profiling capture window for the given step on this worker."""
         AcceleratorUtil.start_profiling(self._accelerator_type, step_idx)
+        return self._cluster_node_rank, time.perf_counter_ns()
 
-    def stop_profile(self) -> None:
+    def stop_profile(self) -> tuple[int, int]:
         """Close the current profiling capture window on this worker."""
         AcceleratorUtil.stop_profiling(self._accelerator_type)
+        return self._cluster_node_rank, time.perf_counter_ns()
 
     @staticmethod
     def check_worker_alive(worker_name: str) -> bool:

@@ -428,8 +428,8 @@ class NvidiaGPUManager(AcceleratorManager):
             return
         import torch
 
-        torch.cuda.nvtx.range_push(label)
+        range_id = torch.cuda.nvtx.range_start(label)
         try:
             yield
         finally:
-            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_end(range_id)

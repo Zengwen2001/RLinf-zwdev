@@ -43,6 +43,7 @@ from rlinf.hybrid_engines.fsdp.utils import (
 from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import ForwardType
+from rlinf.profiling import ProfileStage, profile_range
 from rlinf.scheduler import Channel, Cluster, Worker
 from rlinf.utils.data_iter_utils import (
     get_iterator_k_split,
@@ -1187,7 +1188,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             if hasattr(self, "get_rollout_sync_version")
             else self.version
         )
-        await self.weight_syncer.sync(state_dict, send_func, version=version)
+        with profile_range(ProfileStage.WEIGHT_SYNC_ACTOR_SEND):
+            await self.weight_syncer.sync(state_dict, send_func, version=version)
 
         if self.enable_offload:
             assert not self.is_weight_offloaded, (
@@ -1457,38 +1459,38 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         """
         Train one epoch of SFT.
         """
-        metrics_data["ppo_loss"] = loss.clone().detach().item()
+        with profile_range(ProfileStage.ACTOR_BATCH_PREP):
+            metrics_data["ppo_loss"] = loss.clone().detach().item()
+            try:
+                observation, actions = next(self.sft_iterator)
+            except StopIteration:
+                self.train_epoch += 1
+                self.data_loader.set_epoch(self.train_epoch)
+                self.sft_iterator = iter(self.data_loader)
+                observation, actions = next(self.sft_iterator)
 
-        # Get next data batch
-        try:
-            observation, actions = next(self.sft_iterator)
-        except StopIteration:
-            self.train_epoch += 1
-            self.data_loader.set_epoch(self.train_epoch)
-            self.sft_iterator = iter(self.data_loader)
-            observation, actions = next(self.sft_iterator)
-
-        sft_loss = self.model(
-            data=(observation, actions),
-            forward_type=ForwardType.SFT,
-        )
-        metrics_data["sft_loss"] = sft_loss.detach().item()
-        total_loss = loss + self.sft_loss_weight * sft_loss
-        loss = total_loss
-
-        metrics_data["loss_ratio"] = (
-            np.abs(metrics_data["sft_loss"]) / np.abs(metrics_data["ppo_loss"])
-            if np.abs(metrics_data["ppo_loss"]) > 0
-            else float("inf")
-        )
-        if metrics_data["loss_ratio"] > 1e5:
-            self.logger.warning(
-                "SFT/PPO loss imbalance detected: "
-                f"ratio={metrics_data['loss_ratio']:.3e}, "
-                f"sft_loss={metrics_data['sft_loss']:.6f}, "
-                f"ppo_loss={metrics_data['ppo_loss']:.6f}, "
-                f"sft_loss_weight={self.sft_loss_weight:.6f}"
+        with profile_range(ProfileStage.ACTOR_FORWARD):
+            sft_loss = self.model(
+                data=(observation, actions),
+                forward_type=ForwardType.SFT,
             )
+
+        with profile_range(ProfileStage.ACTOR_LOSS):
+            metrics_data["sft_loss"] = sft_loss.detach().item()
+            loss = loss + self.sft_loss_weight * sft_loss
+            metrics_data["loss_ratio"] = (
+                np.abs(metrics_data["sft_loss"]) / np.abs(metrics_data["ppo_loss"])
+                if np.abs(metrics_data["ppo_loss"]) > 0
+                else float("inf")
+            )
+            if metrics_data["loss_ratio"] > 1e5:
+                self.logger.warning(
+                    "SFT/PPO loss imbalance detected: "
+                    f"ratio={metrics_data['loss_ratio']:.3e}, "
+                    f"sft_loss={metrics_data['sft_loss']:.6f}, "
+                    f"ppo_loss={metrics_data['ppo_loss']:.6f}, "
+                    f"sft_loss_weight={self.sft_loss_weight:.6f}"
+                )
         return loss
 
     @Worker.timer("run_training")
@@ -1515,18 +1517,19 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 )
 
         self.model.train()
-        rollout_size = (
-            self.rollout_batch["prev_logprobs"].shape[0]
-            * self.rollout_batch["prev_logprobs"].shape[1]
-        )
-        g = torch.Generator()
-        g.manual_seed(self.cfg.actor.seed + self._rank)
-        shuffle_id = torch.randperm(rollout_size, generator=g)
-
-        with torch.no_grad():
-            self.rollout_batch = process_nested_dict_for_train(
-                self.rollout_batch, shuffle_id
+        with profile_range(ProfileStage.ACTOR_BATCH_PREP):
+            rollout_size = (
+                self.rollout_batch["prev_logprobs"].shape[0]
+                * self.rollout_batch["prev_logprobs"].shape[1]
             )
+            g = torch.Generator()
+            g.manual_seed(self.cfg.actor.seed + self._rank)
+            shuffle_id = torch.randperm(rollout_size, generator=g)
+
+            with torch.no_grad():
+                self.rollout_batch = process_nested_dict_for_train(
+                    self.rollout_batch, shuffle_id
+                )
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
@@ -1570,9 +1573,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     train_micro_batch[idx] = None
                     del batch
 
-                self.torch_platform.empty_cache()
+                with profile_range(ProfileStage.ACTOR_EMPTY_CACHE):
+                    self.torch_platform.empty_cache()
 
-                grad_norm, lr_list = self.optimizer_step()
+                with profile_range(ProfileStage.ACTOR_OPTIMIZER):
+                    grad_norm, lr_list = self.optimizer_step()
                 data = {
                     "actor/grad_norm": grad_norm,
                     "actor/lr": lr_list[0],
@@ -1586,16 +1591,17 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         clear_memory()
         explained_variance_stats = pop_critic_explained_variance_stats(metrics)
         mean_metric_dict = {key: np.mean(value) for key, value in metrics.items()}
-        mean_metric_dict = all_reduce_dict(
-            mean_metric_dict, op=torch.distributed.ReduceOp.AVG
-        )
-        if explained_variance_stats:
-            reduced_stats = all_reduce_dict(
-                explained_variance_stats, op=torch.distributed.ReduceOp.SUM
+        with profile_range(ProfileStage.ACTOR_METRICS_REDUCE):
+            mean_metric_dict = all_reduce_dict(
+                mean_metric_dict, op=torch.distributed.ReduceOp.AVG
             )
-            mean_metric_dict[CRITIC_EXPLAINED_VARIANCE_KEY] = (
-                compute_critic_explained_variance_from_stats(reduced_stats).item()
-            )
+            if explained_variance_stats:
+                reduced_stats = all_reduce_dict(
+                    explained_variance_stats, op=torch.distributed.ReduceOp.SUM
+                )
+                mean_metric_dict[CRITIC_EXPLAINED_VARIANCE_KEY] = (
+                    compute_critic_explained_variance_from_stats(reduced_stats).item()
+                )
 
         return mean_metric_dict
 
@@ -1606,7 +1612,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         *,
         is_last: bool,
     ) -> None:
-        micro_batch = put_tensor_device(micro_batch, self.device)
+        with profile_range(ProfileStage.ACTOR_H2D):
+            micro_batch = put_tensor_device(micro_batch, self.device)
         backward_ctx = self.before_micro_batch(self.model, is_last_micro_batch=is_last)
         advantages = micro_batch["advantages"]
         prev_logprobs = micro_batch["prev_logprobs"]
@@ -1632,15 +1639,16 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             kwargs["prev_logprobs"] = prev_logprobs
 
         compute_values = self.cfg.algorithm.adv_type == "gae"
-        with self.amp_context:
-            output_dict = self.model(
-                forward_inputs=forward_inputs,
-                compute_logprobs=True,
-                compute_entropy=self.cfg.algorithm.entropy_bonus > 0,
-                compute_values=compute_values,
-                use_cache=False,
-                **kwargs,
-            )
+        with profile_range(ProfileStage.ACTOR_FORWARD):
+            with self.amp_context:
+                output_dict = self.model(
+                    forward_inputs=forward_inputs,
+                    compute_logprobs=True,
+                    compute_entropy=self.cfg.algorithm.entropy_bonus > 0,
+                    compute_values=compute_values,
+                    use_cache=False,
+                    **kwargs,
+                )
 
         if SupportedModel(self.cfg.actor.model.model_type) in [
             SupportedModel.GR00T,
@@ -1686,26 +1694,40 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     self.cfg.algorithm.clip_log_ratio_max
                 )
 
-        loss, metrics_data = policy_loss(**loss_kwargs)
-        entropy_loss = torch.tensor(0.0, device=Worker.torch_platform.current_device())
-        if self.cfg.algorithm.entropy_bonus > 0 and not loss_kwargs["critic_warmup"]:
-            entropy = output_dict["entropy"]
-            entropy = reshape_entropy(
-                entropy,
-                entropy_type=self.cfg.algorithm.entropy_type,
-                action_dim=self.cfg.actor.model.get("action_dim", 7),
-                batch_size=output_dict["logprobs"].shape[0],
+        with profile_range(ProfileStage.ACTOR_LOSS):
+            loss, metrics_data = policy_loss(**loss_kwargs)
+            entropy_loss = torch.tensor(
+                0.0, device=Worker.torch_platform.current_device()
             )
-            entropy_loss = masked_mean(entropy, mask=loss_mask)
-            loss -= self.cfg.algorithm.entropy_bonus * entropy_loss
-        metrics_data["actor/entropy_loss"] = entropy_loss.detach().item()
+            if (
+                self.cfg.algorithm.entropy_bonus > 0
+                and not loss_kwargs["critic_warmup"]
+            ):
+                entropy = output_dict["entropy"]
+                entropy = reshape_entropy(
+                    entropy,
+                    entropy_type=self.cfg.algorithm.entropy_type,
+                    action_dim=self.cfg.actor.model.get("action_dim", 7),
+                    batch_size=output_dict["logprobs"].shape[0],
+                )
+                entropy_loss = masked_mean(entropy, mask=loss_mask)
+                loss -= self.cfg.algorithm.entropy_bonus * entropy_loss
+            metrics_data["actor/entropy_loss"] = entropy_loss.detach().item()
 
         if self.enable_sft_co_train:
             loss = self._train_sft_epoch(metrics_data, loss)
 
-        loss /= self.gradient_accumulation
-        with backward_ctx:
-            self.grad_scaler.scale(loss).backward()
+        with profile_range(ProfileStage.ACTOR_LOSS):
+            loss /= self.gradient_accumulation
+
+        backward_stage = (
+            ProfileStage.ACTOR_BACKWARD_SYNC
+            if is_last
+            else ProfileStage.ACTOR_BACKWARD_NO_SYNC
+        )
+        with profile_range(backward_stage):
+            with backward_ctx:
+                self.grad_scaler.scale(loss).backward()
 
         metrics_data["actor/total_loss"] = loss.detach().item()
         append_to_dict(metrics, metrics_data)

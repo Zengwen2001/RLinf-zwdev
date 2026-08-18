@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 
 from omegaconf.omegaconf import DictConfig
 
-from rlinf.runners.embodied_runner import EmbodiedRunner
+from rlinf.runners.embodied_runner import EmbodiedRunner, close_profile_window_on_error
 from rlinf.scheduler import Channel
 from rlinf.scheduler import WorkerGroupFuncResult as Handle
 from rlinf.utils.runner_utils import check_progress
@@ -106,6 +106,7 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
         self.actor.sync_model_to_rollout().wait()
         rollout_handle.wait()
 
+    @close_profile_window_on_error
     def run(self) -> None:
         start_step = self.global_step
         start_time = time.time()
@@ -161,6 +162,9 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
                 with self.timer("update_rollout_weights"):
                     self.update_rollout_weights()
                 self.rollout.set_global_step(self.global_step).wait()
+
+            if profiled_step is not None:
+                self._close_profiling_window(profiled_step)
 
             time_metrics = self.timer.consume_durations()
             time_metrics = {f"time/{k}": v for k, v in time_metrics.items()}
@@ -265,9 +269,6 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
             )
             if save_model:
                 self._save_checkpoint()
-
-            if profiled_step is not None:
-                self._close_profiling_window(profiled_step)
 
         self.metric_logger.finish()
 

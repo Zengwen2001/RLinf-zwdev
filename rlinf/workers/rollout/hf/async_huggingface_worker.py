@@ -16,6 +16,7 @@ import asyncio
 
 from omegaconf.omegaconf import DictConfig
 
+from rlinf.profiling import ProfileStage, profile_range
 from rlinf.scheduler import Channel, Worker
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
@@ -162,19 +163,20 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
                     await self._poll_background_weight_sync()
                 await self.wait_if_stale()
             decoupled_generate_time = decoupled_generate_time + 1
-            (
-                env_output,
-                split_sizes,
-            ) = await self.recv_from_and_record_batch_routes_with_timeout(
-                group_name=self.cfg.env.group_name,
-                channel=input_channel,
-                tag="rollout_results",
-                batch_size=self.train_batch_size,
-                merge_fn=self._merge_obs_batches,
-                infer_batch_size_fn=self._infer_env_batch_size,
-                timeout_time=0.02,
-                recv_queue_size=self.rollout_queue_size,
-            )
+            with profile_range(ProfileStage.ROLLOUT_RECV_OBS):
+                (
+                    env_output,
+                    split_sizes,
+                ) = await self.recv_from_and_record_batch_routes_with_timeout(
+                    group_name=self.cfg.env.group_name,
+                    channel=input_channel,
+                    tag="rollout_results",
+                    batch_size=self.train_batch_size,
+                    merge_fn=self._merge_obs_batches,
+                    infer_batch_size_fn=self._infer_env_batch_size,
+                    timeout_time=0.02,
+                    recv_queue_size=self.rollout_queue_size,
+                )
             actions, result = self._predict_rollout_actions(
                 env_output["obs"],
                 final_obs=env_output.get("final_obs", None),
@@ -186,11 +188,12 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
                 result,
                 final_obs=env_output.get("final_obs", None),
             )
-            self.send_to_recorded_batch_routes(
-                group_name=self.cfg.env.group_name,
-                channel=output_channel,
-                data=policy_output,
-                tag="rollout_results",
-                split_fn=self._split_policy_output,
-                split_sizes=split_sizes,
-            )
+            with profile_range(ProfileStage.ROLLOUT_SEND_ACTION):
+                self.send_to_recorded_batch_routes(
+                    group_name=self.cfg.env.group_name,
+                    channel=output_channel,
+                    data=policy_output,
+                    tag="rollout_results",
+                    split_fn=self._split_policy_output,
+                    split_sizes=split_sizes,
+                )

@@ -18,6 +18,7 @@ import queue
 import threading
 import time
 from collections import defaultdict
+from functools import wraps
 from typing import TYPE_CHECKING, Union
 
 from omegaconf.dictconfig import DictConfig
@@ -47,6 +48,27 @@ if TYPE_CHECKING:
         AsyncMultiStepRolloutWorker,
     )
     from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
+
+
+def close_profile_window_on_error(run_method):
+    """Ensure a runner exception cannot leave a capture window open."""
+
+    @wraps(run_method)
+    def wrapped(self, *args, **kwargs):
+        try:
+            return run_method(self, *args, **kwargs)
+        except BaseException:
+            step_idx = self._active_profile_step
+            if step_idx is not None:
+                try:
+                    self._close_profiling_window(step_idx)
+                except Exception:
+                    self.logger.exception(
+                        f"Failed to close profiling window at step {step_idx}"
+                    )
+            raise
+
+    return wrapped
 
 
 class EmbodiedRunner:
@@ -89,6 +111,9 @@ class EmbodiedRunner:
             if profile_steps_raw is not None
             else None
         )
+        self._active_profile_step: int | None = None
+        self._profile_start_skew_ms: float | None = None
+        self._profile_stop_skew_ms: float | None = None
 
         # Data channels
         self.env_channel = Channel.create("Env")
@@ -461,20 +486,103 @@ class EmbodiedRunner:
             self._profile_steps is not None and step_idx in self._profile_steps
         )
 
+    def _profiling_worker_groups(self) -> tuple[object, object, object]:
+        """Return worker groups included in the current profiling scope."""
+        return self.actor, self.rollout, self.env
+
+    @staticmethod
+    def _wait_profile_handles(handles: list[Handle]) -> list[object]:
+        """Wait every dispatched call while preserving the first failure."""
+        first_error: Exception | None = None
+        results: list[object] = []
+        for handle in handles:
+            try:
+                results.append(handle.wait())
+            except Exception as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
+        return results
+
+    def _dispatch_profile_calls(self, method_name: str, *args) -> list[object]:
+        """Dispatch a profiling call to every group before waiting for results."""
+        handles: list[Handle] = []
+        first_error: Exception | None = None
+        for group in self._profiling_worker_groups():
+            try:
+                handles.append(getattr(group, method_name)(*args))
+            except Exception as error:
+                if first_error is None:
+                    first_error = error
+
+        try:
+            results = self._wait_profile_handles(handles)
+        except Exception as error:
+            if first_error is None:
+                first_error = error
+        if first_error is not None:
+            raise first_error
+        return results
+
+    def _profile_timestamp_skew_ms(self, results: list[object]) -> float | None:
+        """Compute single-node worker timestamp skew from grouped RPC results."""
+        if int(self.cfg.cluster.get("num_nodes", 1)) != 1:
+            return None
+        samples: list[tuple[int, int]] = []
+        pending = list(results)
+        while pending:
+            result = pending.pop()
+            if (
+                isinstance(result, tuple)
+                and len(result) == 2
+                and all(isinstance(value, int) for value in result)
+            ):
+                samples.append(result)
+            elif isinstance(result, (list, tuple)):
+                pending.extend(result)
+        node_ranks = {node_rank for node_rank, _timestamp in samples}
+        if len(node_ranks) != 1:
+            return None
+        timestamps = [timestamp for _node_rank, timestamp in samples]
+        return (max(timestamps) - min(timestamps)) / 1_000_000
+
     def _open_profiling_window(self, step_idx: int) -> None:
         """Dispatch ``start_profile`` to all compute worker groups for this step."""
+        if self._active_profile_step is not None:
+            raise RuntimeError(
+                f"Profiling window already open at step {self._active_profile_step}"
+            )
         self.logger.info(f"Opening profiling window at step {step_idx}")
-        self.actor.start_profile(step_idx).wait()
-        self.rollout.start_profile(step_idx).wait()
-        self.env.start_profile(step_idx).wait()
+        try:
+            results = self._dispatch_profile_calls("start_profile", step_idx)
+        except BaseException:
+            try:
+                self._dispatch_profile_calls("stop_profile")
+            except Exception:
+                self.logger.exception(
+                    "Failed to clean up workers after profiling window start failure"
+                )
+            raise
+        self._active_profile_step = step_idx
+        self._profile_start_skew_ms = self._profile_timestamp_skew_ms(results)
+        if self._profile_start_skew_ms is not None:
+            self.logger.info(
+                f"Profiling window start skew: {self._profile_start_skew_ms:.3f} ms"
+            )
 
     def _close_profiling_window(self, step_idx: int) -> None:
         """Dispatch ``stop_profile`` to all compute worker groups."""
-        self.actor.stop_profile().wait()
-        self.rollout.stop_profile().wait()
-        self.env.stop_profile().wait()
+        results = self._dispatch_profile_calls("stop_profile")
+        self._profile_stop_skew_ms = self._profile_timestamp_skew_ms(results)
+        self._active_profile_step = None
+        if self._profile_stop_skew_ms is not None:
+            self.logger.info(
+                f"Profiling window stop skew: {self._profile_stop_skew_ms:.3f} ms"
+            )
         self.logger.info(f"Closed profiling window at step {step_idx}")
 
+    @close_profile_window_on_error
     def run(self):
         if self.cfg.runner.get("use_training_pipeline", False):
             return self.run_pipeline()
@@ -562,6 +670,7 @@ class EmbodiedRunner:
 
         self._finish_run()
 
+    @close_profile_window_on_error
     def run_pipeline(self):
         start_step = self.global_step
         start_time = time.time()
