@@ -15,6 +15,7 @@
 import asyncio
 import copy
 import gc
+import random
 import time
 from typing import Any, Callable, Literal, Optional
 
@@ -33,7 +34,12 @@ from rlinf.data.schema.embodied_types import PolicyOutput
 from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
-from rlinf.profiling import ProfileStage, profile_range
+from rlinf.profiling import (
+    ProfileFixtureCapture,
+    ProfileFixtureKind,
+    ProfileStage,
+    profile_range,
+)
 from rlinf.scheduler import Channel, Cluster, Worker, split_channel_message
 from rlinf.utils.placement import HybridComponentPlacement
 
@@ -116,6 +122,9 @@ class MultiStepRolloutWorker(Worker):
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
         self.version = 0
         self.finished_episodes = None
+        self._profile_fixture_capture = ProfileFixtureCapture.from_config(
+            self.cfg, rank=self._rank, role="rollout"
+        )
 
         self.weight_syncer = None
         self._sync_weight_comm_options = None
@@ -560,6 +569,30 @@ class MultiStepRolloutWorker(Worker):
         rlt_switch_flags: torch.Tensor | None = None,
         intervene_requested: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
+        fixture_kind = ProfileFixtureKind.ROLLOUT_OBSERVATION
+        if self._profile_fixture_capture.wants(fixture_kind, version=self.version):
+            self._profile_fixture_capture.maybe_dump(
+                fixture_kind,
+                version=self.version,
+                payload={
+                    "env_obs": env_obs,
+                    "final_obs": final_obs,
+                    "rlt_switch_flags": rlt_switch_flags,
+                    "intervene_requested": intervene_requested,
+                    "torch_rng_state": torch.get_rng_state(),
+                    "cuda_rng_state": (
+                        torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+                    ),
+                    "python_rng_state": random.getstate(),
+                },
+                metadata={
+                    "mode": mode,
+                    "model_path": str(self.cfg.rollout.model.model_path),
+                    "model_type": str(self.model_cfg.model_type),
+                    "batch_size": self._infer_env_batch_size(env_obs),
+                    "num_action_chunks": int(self.model_cfg.num_action_chunks),
+                },
+            )
         if self.rlt_feature_model is not None:
             return predict_rlt_actions(
                 policy_model=self.hf_model,

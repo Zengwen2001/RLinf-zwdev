@@ -1,0 +1,5 @@
+enabled: true
+version: 2
+kinds: [actor_microbatch, rollout_observation]
+max_per_kind_per_rank: 1
+output_dir: ${runner.logger.log_path}/${runner.logger.experiment_name}/overlap_profile/fixtures

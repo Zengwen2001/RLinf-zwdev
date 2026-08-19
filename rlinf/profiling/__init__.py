@@ -14,6 +14,13 @@
 
 """Low-overhead profiling annotations for RLinf execution stages."""
 
+from .fixture import ProfileFixtureCapture, ProfileFixtureKind, load_profile_fixture
 from .stages import ProfileStage, profile_range
 
-__all__ = ["ProfileStage", "profile_range"]
+__all__ = [
+    "ProfileFixtureCapture",
+    "ProfileFixtureKind",
+    "ProfileStage",
+    "load_profile_fixture",
+    "profile_range",
+]

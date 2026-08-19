@@ -1406,6 +1406,13 @@ def validate_cfg(cfg: DictConfig) -> DictConfig:
                         "profiling",
                     )
                 )
+        capture_cfg = cfg.runner.get("profile_capture", None)
+        if capture_cfg is not None and bool(capture_cfg.get("enabled", False)):
+            if profiling_cfg is not None and bool(profiling_cfg.get("enabled", True)):
+                raise ValueError(
+                    "runner.profile_capture and cluster.profiling cannot be enabled "
+                    "in the same run"
+                )
 
     # Tracing defaults. The tracer is a cluster manager, so its config lives under
     # `cluster.tracer` and is launched by the Cluster below when enabled.

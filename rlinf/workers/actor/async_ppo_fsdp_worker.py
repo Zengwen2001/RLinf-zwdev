@@ -25,7 +25,12 @@ from rlinf.algorithms.registry import calculate_adv_and_returns, policy_loss
 from rlinf.config import SupportedModel
 from rlinf.data.schema.embodied_types import Trajectory, convert_trajectories_to_batch
 from rlinf.data.storage.replay import PriorityStore
-from rlinf.profiling import ProfileStage, profile_range
+from rlinf.profiling import (
+    ProfileFixtureCapture,
+    ProfileFixtureKind,
+    ProfileStage,
+    profile_range,
+)
 from rlinf.scheduler import Worker
 from rlinf.utils.distributed import all_reduce_dict, masked_normalization
 from rlinf.utils.metric_utils import (
@@ -81,6 +86,9 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
             "rollout_store_size_per_rank", 1
         )
         self.rollout_store = PriorityStore(maxsize=self.rollout_store_size)
+        self._profile_fixture_capture = ProfileFixtureCapture.from_config(
+            self.cfg, rank=self._rank, role="actor"
+        )
 
     async def recv_rollout_trajectories(self, input_channel):
         # drain channel
@@ -272,6 +280,120 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
         )
         self.rollout_batch["proximal_logprobs"] = proximal_logprobs
 
+    def forward_micro_batch(
+        self, data: dict[str, Any]
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+        """Run the production model forward for one async-PPO device batch."""
+        old_logprobs = data["prev_logprobs"]
+        forward_inputs = data.get("forward_inputs", None)
+        if forward_inputs is None:
+            raise ValueError(
+                "Missing forward_inputs in run_training. "
+                "This usually means batch splitting dropped nested dict fields."
+            )
+
+        model_kwargs = {}
+        if SupportedModel(self.cfg.actor.model.model_type) in [
+            SupportedModel.OPENVLA,
+            SupportedModel.OPENVLA_OFT,
+        ]:
+            model_kwargs["temperature"] = (
+                self.cfg.rollout.sampling_params.temperature_train
+            )
+            model_kwargs["top_k"] = self.cfg.rollout.sampling_params.top_k
+        elif SupportedModel(self.cfg.actor.model.model_type) in [
+            SupportedModel.GR00T,
+            SupportedModel.ABOT_M0,
+        ]:
+            model_kwargs["prev_logprobs"] = old_logprobs
+
+        compute_values = self.cfg.algorithm.adv_type == "gae"
+        with profile_range(ProfileStage.ACTOR_FORWARD):
+            with self.amp_context:
+                out = self.model(
+                    forward_inputs=forward_inputs,
+                    compute_logprobs=True,
+                    compute_entropy=(self.cfg.algorithm.entropy_bonus > 0),
+                    compute_values=compute_values,
+                    use_cache=False,
+                    **model_kwargs,
+                )
+
+        if SupportedModel(self.cfg.actor.model.model_type) in [
+            SupportedModel.GR00T,
+            SupportedModel.ABOT_M0,
+        ]:
+            old_logprobs = out["prev_logprobs"]
+
+        return out, old_logprobs
+
+    def forward_and_loss_micro_batch(
+        self, data: dict[str, Any]
+    ) -> tuple[torch.Tensor, dict[str, Any], torch.Tensor]:
+        """Run the production async-PPO forward and loss for one device batch."""
+        out, old_logprobs = self.forward_micro_batch(data)
+        advantages = data["advantages"]
+        returns = data.get("returns", None)
+        prev_values = data.get("prev_values", None)
+        loss_mask = data.get("loss_mask", None)
+        loss_mask_sum = data.get("loss_mask_sum", None)
+
+        versions = data.get("versions", None)
+        proximal_logprobs = data.get("proximal_logprobs", None)
+        proximal_values = data.get("proximal_values", None)
+        current_version = int(self.version) + 1
+
+        loss_kwargs = {
+            "loss_type": self.cfg.algorithm.loss_type,
+            "logprob_type": self.cfg.algorithm.logprob_type,
+            "reward_type": self.cfg.algorithm.reward_type,
+            "single_action_dim": self.cfg.actor.model.get("action_dim", 7),
+            "logprobs": out["logprobs"],
+            "values": out.get("values", None),
+            "old_logprobs": old_logprobs,
+            "advantages": advantages,
+            "returns": returns,
+            "prev_values": (
+                proximal_values if proximal_values is not None else prev_values
+            ),
+            "proximal_logprobs": proximal_logprobs,
+            "versions": versions,
+            "current_version": current_version,
+            "behave_weight_threshold": self.cfg.algorithm.get(
+                "behave_weight_threshold", None
+            ),
+            "clip_ratio_c": self.cfg.algorithm.get("clip_ratio_c", 3.0),
+            "clip_ratio_high": self.cfg.algorithm.clip_ratio_high,
+            "clip_ratio_low": self.cfg.algorithm.clip_ratio_low,
+            "value_clip": self.cfg.algorithm.get("value_clip", None),
+            "huber_delta": self.cfg.algorithm.get("huber_delta", None),
+            "loss_mask": loss_mask,
+            "loss_mask_sum": loss_mask_sum,
+            "max_episode_steps": self.cfg.env.train.max_episode_steps,
+            "task_type": self.cfg.runner.task_type,
+            "critic_warmup": self.optimizer_steps < self.critic_warmup_steps,
+        }
+
+        with profile_range(ProfileStage.ACTOR_LOSS):
+            loss, metrics_data = policy_loss(**loss_kwargs)
+            entropy_loss = torch.tensor(0.0, device=torch.cuda.current_device())
+            if (
+                self.cfg.algorithm.entropy_bonus > 0
+                and not loss_kwargs["critic_warmup"]
+            ):
+                entropy = reshape_entropy(
+                    out["entropy"],
+                    entropy_type=self.cfg.algorithm.entropy_type,
+                    action_dim=self.cfg.actor.model.get("action_dim", 7),
+                    batch_size=out["logprobs"].shape[0],
+                )
+                entropy_loss = masked_mean(entropy, mask=loss_mask)
+                loss = loss - self.cfg.algorithm.entropy_bonus * entropy_loss
+
+            loss = loss / self.gradient_accumulation
+
+        return loss, metrics_data, entropy_loss
+
     def run_training(self) -> dict[str, Any]:
         if self.is_weight_offloaded:
             self.load_param_and_grad(self.device)
@@ -347,6 +469,25 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
                 self.optimizer.zero_grad()
 
                 for mb_idx, data in enumerate(micro_batch_iter):
+                    fixture_kind = ProfileFixtureKind.ACTOR_MICROBATCH
+                    if self._profile_fixture_capture.wants(
+                        fixture_kind, version=self.version
+                    ):
+                        self._profile_fixture_capture.maybe_dump(
+                            fixture_kind,
+                            version=self.version,
+                            payload={"data": data},
+                            metadata={
+                                "global_batch_size": global_batch_size,
+                                "micro_batch_size": micro_batch_size,
+                                "world_size": world_size,
+                                "gradient_accumulation": self.gradient_accumulation,
+                                "update_epoch": update_epoch,
+                                "micro_batch_index": mb_idx,
+                                "model_path": str(self.cfg.actor.model.model_path),
+                                "model_type": str(self.cfg.actor.model.model_type),
+                            },
+                        )
                     with profile_range(ProfileStage.ACTOR_H2D):
                         data = put_tensor_device(
                             data,
@@ -358,114 +499,9 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
                         is_last_micro_batch=is_last_micro_batch,
                     )
 
-                    advantages = data["advantages"]
-                    old_logprobs = data["prev_logprobs"]
-                    returns = data.get("returns", None)
-                    prev_values = data.get("prev_values", None)
-                    loss_mask = data.get("loss_mask", None)
-                    loss_mask_sum = data.get("loss_mask_sum", None)
-
-                    versions = data.get("versions", None)
-                    proximal_logprobs = data.get("proximal_logprobs", None)
-                    proximal_values = data.get("proximal_values", None)
-                    current_version = int(self.version) + 1
-
-                    forward_inputs = data.get("forward_inputs", None)
-                    if forward_inputs is None:
-                        raise ValueError(
-                            "Missing forward_inputs in run_training. "
-                            "This usually means batch splitting dropped nested dict fields."
-                        )
-
-                    model_kwargs = {}
-                    if SupportedModel(self.cfg.actor.model.model_type) in [
-                        SupportedModel.OPENVLA,
-                        SupportedModel.OPENVLA_OFT,
-                    ]:
-                        model_kwargs["temperature"] = (
-                            self.cfg.rollout.sampling_params.temperature_train
-                        )
-                        model_kwargs["top_k"] = self.cfg.rollout.sampling_params.top_k
-                    elif SupportedModel(self.cfg.actor.model.model_type) in [
-                        SupportedModel.GR00T,
-                        SupportedModel.ABOT_M0,
-                    ]:
-                        model_kwargs["prev_logprobs"] = old_logprobs
-
-                    compute_values = self.cfg.algorithm.adv_type == "gae"
-
-                    with profile_range(ProfileStage.ACTOR_FORWARD):
-                        with self.amp_context:
-                            out = self.model(
-                                forward_inputs=forward_inputs,
-                                compute_logprobs=True,
-                                compute_entropy=(self.cfg.algorithm.entropy_bonus > 0),
-                                compute_values=compute_values,
-                                use_cache=False,
-                                **model_kwargs,
-                            )
-
-                    if SupportedModel(self.cfg.actor.model.model_type) in [
-                        SupportedModel.GR00T,
-                        SupportedModel.ABOT_M0,
-                    ]:
-                        old_logprobs = out["prev_logprobs"]
-
-                    loss_kwargs = {
-                        "loss_type": self.cfg.algorithm.loss_type,
-                        "logprob_type": self.cfg.algorithm.logprob_type,
-                        "reward_type": self.cfg.algorithm.reward_type,
-                        "single_action_dim": self.cfg.actor.model.get("action_dim", 7),
-                        "logprobs": out["logprobs"],
-                        "values": out.get("values", None),
-                        "old_logprobs": old_logprobs,
-                        "advantages": advantages,
-                        "returns": returns,
-                        "prev_values": proximal_values
-                        if proximal_values is not None
-                        else prev_values,
-                        "proximal_logprobs": proximal_logprobs,
-                        "versions": versions,
-                        "current_version": current_version,
-                        "behave_weight_threshold": self.cfg.algorithm.get(
-                            "behave_weight_threshold", None
-                        ),
-                        "clip_ratio_c": self.cfg.algorithm.get("clip_ratio_c", 3.0),
-                        "clip_ratio_high": self.cfg.algorithm.clip_ratio_high,
-                        "clip_ratio_low": self.cfg.algorithm.clip_ratio_low,
-                        "value_clip": self.cfg.algorithm.get("value_clip", None),
-                        "huber_delta": self.cfg.algorithm.get("huber_delta", None),
-                        "loss_mask": loss_mask,
-                        "loss_mask_sum": loss_mask_sum,
-                        "max_episode_steps": self.cfg.env.train.max_episode_steps,
-                        "task_type": self.cfg.runner.task_type,
-                        "critic_warmup": self.optimizer_steps
-                        < self.critic_warmup_steps,
-                    }
-
-                    with profile_range(ProfileStage.ACTOR_LOSS):
-                        loss, metrics_data = policy_loss(**loss_kwargs)
-
-                        entropy_loss = torch.tensor(
-                            0.0, device=torch.cuda.current_device()
-                        )
-                        if (
-                            self.cfg.algorithm.entropy_bonus > 0
-                            and not loss_kwargs["critic_warmup"]
-                        ):
-                            entropy = out["entropy"]
-                            entropy = reshape_entropy(
-                                entropy,
-                                entropy_type=self.cfg.algorithm.entropy_type,
-                                action_dim=self.cfg.actor.model.get("action_dim", 7),
-                                batch_size=out["logprobs"].shape[0],
-                            )
-                            entropy_loss = masked_mean(entropy, mask=loss_mask)
-                            loss = (
-                                loss - self.cfg.algorithm.entropy_bonus * entropy_loss
-                            )
-
-                        loss = loss / self.gradient_accumulation
+                    loss, metrics_data, entropy_loss = (
+                        self.forward_and_loss_micro_batch(data)
+                    )
 
                     backward_stage = (
                         ProfileStage.ACTOR_BACKWARD_SYNC

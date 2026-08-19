@@ -126,6 +126,16 @@ def test_async_ppo_actor_has_training_stage_ranges():
         "AsyncPPOEmbodiedFSDPActor",
         "run_training",
     )
+    stages |= _function_stages(
+        "rlinf/workers/actor/async_ppo_fsdp_worker.py",
+        "AsyncPPOEmbodiedFSDPActor",
+        "forward_and_loss_micro_batch",
+    )
+    stages |= _function_stages(
+        "rlinf/workers/actor/async_ppo_fsdp_worker.py",
+        "AsyncPPOEmbodiedFSDPActor",
+        "forward_micro_batch",
+    )
     assert stages == {
         "ACTOR_BATCH_PREP",
         "ACTOR_H2D",
