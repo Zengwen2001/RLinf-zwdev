@@ -27,6 +27,7 @@ from toolkits.overlap_profiler.adapters import (
 class _FakeOptimizer:
     def __init__(self):
         self.zero_grad_calls = 0
+        self.param_groups = [{"lr": 1e-3}]
 
     def zero_grad(self):
         self.zero_grad_calls += 1
@@ -128,7 +129,7 @@ def test_actor_adapter_reuses_production_forward_and_loss(tmp_path):
         tmp_path,
         ProfileFixtureKind.ACTOR_MICROBATCH,
         {"data": {"forward_inputs": {"x": torch.ones(2, 2)}}},
-        {"gradient_accumulation": 4},
+        {"gradient_accumulation": 4, "micro_batch_size": 2},
     )
     actor = _FakeActor()
     adapter = ActorFSDPReplayAdapter(actor, str(fixture))
@@ -140,6 +141,7 @@ def test_actor_adapter_reuses_production_forward_and_loss(tmp_path):
     assert actor.forward_calls == 1
     assert actor.gradient_accumulation == 4
     assert adapter.work_signature()["stage"] == "actor.forward"
+    assert adapter.work_units() == {"microbatches": 1, "samples": 2}
 
 
 def test_actor_backward_rebuilds_graph_before_timed_stage(tmp_path):
@@ -159,6 +161,22 @@ def test_actor_backward_rebuilds_graph_before_timed_stage(tmp_path):
     assert actor.model.weight.grad is not None
 
 
+def test_actor_optimizer_replay_uses_zero_lr_and_restores_it(tmp_path):
+    fixture = _capture_fixture(
+        tmp_path,
+        ProfileFixtureKind.ACTOR_MICROBATCH,
+        {"data": {"forward_inputs": {"x": torch.ones(2, 2)}}},
+    )
+    actor = _FakeActor()
+    adapter = ActorFSDPReplayAdapter(actor, str(fixture))
+
+    adapter.prepare("actor.optimizer")
+    assert actor.optimizer.param_groups[0]["lr"] == 0.0
+    adapter.close()
+
+    assert actor.optimizer.param_groups[0]["lr"] == 1e-3
+
+
 def test_openpi_ae_prepare_keeps_prefix_outside_replayed_stage(tmp_path):
     fixture = _capture_fixture(
         tmp_path,
@@ -168,7 +186,7 @@ def test_openpi_ae_prepare_keeps_prefix_outside_replayed_stage(tmp_path):
             "torch_rng_state": torch.get_rng_state(),
             "cuda_rng_state": None,
         },
-        {"mode": "train"},
+        {"mode": "train", "batch_size": 2, "num_action_chunks": 5},
     )
     model = _FakeOpenPIModel()
     adapter = _TestOpenPIAdapter(model, str(fixture))
@@ -183,3 +201,4 @@ def test_openpi_ae_prepare_keeps_prefix_outside_replayed_stage(tmp_path):
     assert model.denoise_calls == 1
     assert result["actions"].shape == (2, 2, 2)
     assert adapter.work_signature()["num_steps"] == 3
+    assert adapter.work_units()["denoise_iterations"] == 6

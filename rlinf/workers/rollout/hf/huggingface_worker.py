@@ -146,6 +146,33 @@ class MultiStepRolloutWorker(Worker):
             }
         self.rollout_queue_size = self.cfg.rollout.get("rollout_queue_size", 0)
 
+    def prepare_overlap_replay(self, fixture_dir: str, stage: str) -> dict[str, Any]:
+        from toolkits.overlap_profiler.timing import install_rollout_replay
+
+        return install_rollout_replay(self, fixture_dir, stage)
+
+    def prepare_overlap_replay_iteration(self) -> dict[str, Any]:
+        from toolkits.overlap_profiler.timing import prepare_replay_iteration
+
+        return prepare_replay_iteration(self)
+
+    def run_overlap_replay(
+        self, start_at_monotonic_ns: int, trial_id: str
+    ) -> dict[str, Any]:
+        from toolkits.overlap_profiler.timing import run_replay_at
+
+        return run_replay_at(self, start_at_monotonic_ns, trial_id)
+
+    def reset_overlap_replay(self) -> dict[str, Any]:
+        from toolkits.overlap_profiler.timing import reset_replay
+
+        return reset_replay(self)
+
+    def close_overlap_replay(self) -> dict[str, Any]:
+        from toolkits.overlap_profiler.timing import close_replay
+
+        return close_replay(self)
+
     def init_worker(self):
         rollout_model_config = copy.deepcopy(self.model_cfg)
         with open_dict(rollout_model_config):

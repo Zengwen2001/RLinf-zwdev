@@ -112,6 +112,10 @@ def main(cfg) -> None:
     )
 
     runner.init_workers()
+    from toolkits.overlap_profiler.controller import run_configured_matrix
+
+    if run_configured_matrix(cfg, actor_group, rollout_group):
+        return
     runner.run()
 
 

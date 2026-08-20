@@ -1,0 +1,10 @@
+backend: nsight
+enabled: true
+worker_groups: [ActorGroup, RolloutGroup]
+steps: [0]
+options:
+  t: cuda,nvtx,osrt
+  sample: none
+  cpuctxsw: none
+  osrt-threshold: 1000
+flags: []

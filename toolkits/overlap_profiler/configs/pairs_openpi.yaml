@@ -1,0 +1,25 @@
+pairs:
+  - id: actor_forward__rollout_vlm_prefix
+    a: {role: actor, stage: actor.forward}
+    b: {role: rollout, stage: rollout.vlm_prefix}
+  - id: actor_forward__rollout_ae_denoise
+    a: {role: actor, stage: actor.forward}
+    b: {role: rollout, stage: rollout.ae_denoise}
+  - id: actor_backward_no_sync__rollout_vlm_prefix
+    a: {role: actor, stage: actor.backward_no_sync}
+    b: {role: rollout, stage: rollout.vlm_prefix}
+  - id: actor_backward_no_sync__rollout_ae_denoise
+    a: {role: actor, stage: actor.backward_no_sync}
+    b: {role: rollout, stage: rollout.ae_denoise}
+  - id: actor_backward_sync__rollout_vlm_prefix
+    a: {role: actor, stage: actor.backward_sync}
+    b: {role: rollout, stage: rollout.vlm_prefix}
+  - id: actor_backward_sync__rollout_ae_denoise
+    a: {role: actor, stage: actor.backward_sync}
+    b: {role: rollout, stage: rollout.ae_denoise}
+  - id: actor_optimizer__rollout_vlm_prefix
+    a: {role: actor, stage: actor.optimizer}
+    b: {role: rollout, stage: rollout.vlm_prefix}
+  - id: actor_optimizer__rollout_ae_denoise
+    a: {role: actor, stage: actor.optimizer}
+    b: {role: rollout, stage: rollout.ae_denoise}

@@ -1,0 +1,15 @@
+pairs:
+  - id: actor_forward_gpu__rollout_vlm_prefix
+    alignment_mode: gpu_compute
+    a: {role: actor, stage: actor.forward}
+    b:
+      role: rollout
+      stage: rollout.vlm_prefix
+      start_delay_ms: ${oc.env:ACTOR_FORWARD_GPU_OFFSET_MS}
+  - id: actor_forward_gpu__rollout_ae_denoise
+    alignment_mode: gpu_compute
+    a: {role: actor, stage: actor.forward}
+    b:
+      role: rollout
+      stage: rollout.ae_denoise
+      start_delay_ms: ${oc.env:ACTOR_FORWARD_GPU_OFFSET_MS}

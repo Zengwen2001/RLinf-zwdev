@@ -1,0 +1,11 @@
+enabled: true
+fixture_dir: ${oc.env:OVERLAP_FIXTURE_DIR}
+pairs_file: ${oc.env:REPO_PATH}/toolkits/overlap_profiler/configs/pairs_openpi.yaml
+output_dir: ${runner.logger.log_path}/${runner.logger.experiment_name}/overlap_profile/matrix
+warmup: 5
+repetitions: 20
+seed: 42
+start_lead_ms: 100.0
+max_start_skew_ms: 2.0
+min_overlap_coverage: 0.8
+profile_workers: false

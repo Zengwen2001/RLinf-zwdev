@@ -25,6 +25,10 @@ class ReplayAdapter(ABC):
     def work_signature(self) -> Any:
         """Return a stable structural description of the prepared workload."""
 
+    def work_units(self) -> dict[str, int | float]:
+        """Return fixed-work numerators used to derive stage throughput."""
+        return {"stage_calls": 1}
+
     def synchronize(self) -> None:
         """Synchronize the active accelerator after a trial."""
         import torch
@@ -34,3 +38,6 @@ class ReplayAdapter(ABC):
 
     def reset_between_trials(self) -> None:
         """Reset mutable state after a trial when the stage requires it."""
+
+    def close(self) -> None:
+        """Restore worker state changed while preparing replay."""

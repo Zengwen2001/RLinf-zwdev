@@ -35,6 +35,7 @@ class ActorFSDPReplayAdapter(ReplayAdapter):
         self.data: dict[str, Any] | None = None
         self._loss = None
         self._backward_context = None
+        self._original_lrs: list[float] | None = None
 
     def prepare(self, stage: str) -> None:
         self.stage = ActorReplayStage(stage)
@@ -46,6 +47,15 @@ class ActorFSDPReplayAdapter(ReplayAdapter):
         )
         self.actor.gradient_accumulation = int(gradient_accumulation)
         self.actor.optimizer.zero_grad()
+        if self.stage in {
+            ActorReplayStage.OPTIMIZER,
+            ActorReplayStage.FULL_MICROBATCH,
+        }:
+            self._original_lrs = [
+                float(group["lr"]) for group in self.actor.optimizer.param_groups
+            ]
+            for group in self.actor.optimizer.param_groups:
+                group["lr"] = 0.0
 
     def prepare_iteration(self) -> None:
         self._require_prepared()
@@ -97,6 +107,15 @@ class ActorFSDPReplayAdapter(ReplayAdapter):
         self._loss = None
         self._backward_context = None
 
+    def close(self) -> None:
+        if self._original_lrs is None:
+            return
+        for group, learning_rate in zip(
+            self.actor.optimizer.param_groups, self._original_lrs, strict=True
+        ):
+            group["lr"] = learning_rate
+        self._original_lrs = None
+
     def work_signature(self) -> Any:
         self._require_prepared()
         return {
@@ -106,6 +125,19 @@ class ActorFSDPReplayAdapter(ReplayAdapter):
             "data": work_signature(self.data),
             "gradient_accumulation": self.actor.gradient_accumulation,
         }
+
+    def work_units(self) -> dict[str, int | float]:
+        self._require_prepared()
+        units: dict[str, int | float] = {
+            "microbatches": 1,
+            "samples": int(self.fixture["metadata"].get("micro_batch_size", 0)),
+        }
+        if self.stage in {
+            ActorReplayStage.OPTIMIZER,
+            ActorReplayStage.FULL_MICROBATCH,
+        }:
+            units["optimizer_steps"] = 1
+        return units
 
     def _require_prepared(self) -> None:
         if self.stage is None or self.data is None:

@@ -100,6 +100,21 @@ class OpenPIReplayAdapter(ReplayAdapter):
             "action_dim": int(self.model.config.action_dim),
         }
 
+    def work_units(self) -> dict[str, int | float]:
+        self._require_prepared()
+        batch_size = int(self.fixture["metadata"].get("batch_size", 0))
+        units: dict[str, int | float] = {
+            "policy_calls": 1,
+            "observations": batch_size,
+        }
+        if self.stage == OpenPIReplayStage.AE_DENOISE:
+            units["action_chunks"] = batch_size
+            units["denoise_iterations"] = batch_size * int(self.model.config.num_steps)
+        elif self.stage == OpenPIReplayStage.FULL_POLICY:
+            num_chunks = int(self.fixture["metadata"].get("num_action_chunks", 1))
+            units["action_chunks"] = batch_size * num_chunks
+        return units
+
     def _build_observation(self):
         from openpi.models import model as openpi_model
 
