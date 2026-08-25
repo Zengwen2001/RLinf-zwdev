@@ -16,6 +16,7 @@ import math
 import random
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -169,6 +170,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         self.sample_actions = sample_actions_func
         self.logger = get_logger()
         self.global_step = 0
+        self._rollout_vlm_stage_gate = None
         # assert
         assert not (self.config.double_layer and self.config.joint_logprob), (
             "double_layer and joint_logprob can not be set at the same time"
@@ -290,6 +292,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             setattr(module, "_fsdp_wrap_name", path_parts[-1] if path_parts else name)
 
         self.torch_compile_enabled = False
+
+    def set_rollout_vlm_stage_gate(self, gate: Any) -> None:
+        """Set the rollout-only gate protecting VLM prefix computation."""
+        self._rollout_vlm_stage_gate = gate
 
     def set_global_step(self, global_step):
         self.global_step = global_step
@@ -991,10 +997,18 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 self._preprocess_observation(observation, train=False)
             )
 
-        with profile_range(ProfileStage.ROLLOUT_VLM_PREFIX):
-            prefix_output, prefix_pad_masks, past_key_values = self._build_prefix_cache(
-                images, img_masks, lang_tokens, lang_masks
-            )
+        gate_context = (
+            self._rollout_vlm_stage_gate.hold()
+            if self._rollout_vlm_stage_gate is not None
+            else nullcontext()
+        )
+        with gate_context:
+            with profile_range(ProfileStage.ROLLOUT_VLM_PREFIX):
+                prefix_output, prefix_pad_masks, past_key_values = (
+                    self._build_prefix_cache(
+                        images, img_masks, lang_tokens, lang_masks
+                    )
+                )
 
         return self._sample_actions_with_prefix_cache(
             state,

@@ -14,6 +14,7 @@
 
 import asyncio
 import time
+import uuid
 from typing import TYPE_CHECKING
 
 from omegaconf.omegaconf import DictConfig
@@ -51,6 +52,27 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
         self.recompute_logprobs = bool(
             self.cfg.rollout.get("recompute_logprobs", False)
         )
+        self.pause_rollout_during_actor_training = bool(
+            self.cfg.runner.get("pause_rollout_during_actor_training", False)
+        )
+        self.actor_vlm_stage_gate = bool(
+            self.cfg.runner.get("actor_vlm_stage_gate", False)
+        )
+        self.actor_vlm_gate_forward = bool(
+            self.cfg.runner.get("actor_vlm_gate_forward", False)
+        )
+        self.actor_vlm_gate_backward = bool(
+            self.cfg.runner.get("actor_vlm_gate_backward", True)
+        )
+        if self.pause_rollout_during_actor_training and self.actor_vlm_stage_gate:
+            raise ValueError(
+                "pause_rollout_during_actor_training and actor_vlm_stage_gate "
+                "cannot both be enabled"
+            )
+        if self.actor_vlm_gate_forward and not self.actor_vlm_stage_gate:
+            raise ValueError(
+                "actor_vlm_gate_forward requires actor_vlm_stage_gate=true"
+            )
 
         if self.cfg.runner.val_check_interval > 0:
             self.logger.warning(
@@ -106,6 +128,32 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
         self.actor.sync_model_to_rollout().wait()
         rollout_handle.wait()
 
+    def _run_actor_training(self) -> tuple[Handle, object]:
+        pause_rollout = getattr(
+            self, "pause_rollout_during_actor_training", False
+        )
+        pause_requested = False
+        try:
+            if pause_rollout:
+                pause_requested = True
+                with self.timer("pause_rollout_inference"):
+                    self.rollout.pause_inference_at_boundary().wait()
+            with self.timer("actor_training"):
+                actor_training_handle = self.actor.run_training()
+                training_metrics = actor_training_handle.wait()
+        finally:
+            if pause_requested:
+                with self.timer("resume_rollout_inference"):
+                    self.rollout.resume_inference().wait()
+        return actor_training_handle, training_metrics
+
+    def _configure_actor_vlm_stage_gate(self) -> None:
+        if not getattr(self, "actor_vlm_stage_gate", False):
+            return
+        gate_id = f"actor-vlm-{uuid.uuid4().hex}"
+        self.actor.configure_actor_vlm_stage_gate(gate_id).wait()
+        self.rollout.configure_actor_vlm_stage_gate(gate_id).wait()
+
     @close_profile_window_on_error
     def run(self) -> None:
         start_step = self.global_step
@@ -113,6 +161,7 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
 
         self.actor.set_global_step(self.global_step).wait()
         self.rollout.set_global_step(self.global_step).wait()
+        self._configure_actor_vlm_stage_gate()
         self.update_rollout_weights()
 
         env_handle: Handle = self.env.interact(
@@ -153,9 +202,7 @@ class AsyncPPOEmbodiedRunner(EmbodiedRunner):
                         self.actor.compute_advantages_and_returns().wait()
                     )
 
-                with self.timer("actor_training"):
-                    actor_training_handle = self.actor.run_training()
-                    training_metrics = actor_training_handle.wait()
+                actor_training_handle, training_metrics = self._run_actor_training()
 
                 self.global_step += 1
                 self.actor.set_global_step(self.global_step).wait()

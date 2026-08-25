@@ -16,6 +16,8 @@ import asyncio
 import os
 import queue
 import threading
+from collections import Counter
+from contextlib import nullcontext
 from typing import Any, Optional
 
 import numpy as np
@@ -32,6 +34,7 @@ from rlinf.profiling import (
     profile_range,
 )
 from rlinf.scheduler import Worker
+from rlinf.scheduler.stage_gate import InterProcessStageGate
 from rlinf.utils.distributed import all_reduce_dict, masked_normalization
 from rlinf.utils.metric_utils import (
     CRITIC_EXPLAINED_VARIANCE_KEY,
@@ -89,6 +92,63 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
         self._profile_fixture_capture = ProfileFixtureCapture.from_config(
             self.cfg, rank=self._rank, role="actor"
         )
+        self._actor_vlm_stage_gate: InterProcessStageGate | None = None
+        self._recv_queue_metadata_lock = threading.Lock()
+        self._recv_version_counts: Counter[float] = Counter()
+
+    def configure_actor_vlm_stage_gate(self, gate_id: str) -> None:
+        """Configure the gate shared with the rollout worker on this GPU."""
+        self._actor_vlm_stage_gate = InterProcessStageGate(
+            gate_id,
+            node_rank=self._cluster_node_rank,
+            accelerator_rank=self._local_accelerator_rank,
+            wait_stage=ProfileStage.ACTOR_WAIT_ROLLOUT_VLM,
+            synchronize=self.torch_platform.synchronize,
+            record_wait=lambda duration: self._record_stage_gate_wait(
+                "actor_vlm_gate_wait", duration
+            ),
+        )
+
+    def _record_stage_gate_wait(self, tag: str, duration: float) -> None:
+        self._timer_metrics[tag] = self._timer_metrics.get(tag, 0.0) + duration
+
+    def _has_fresh_next_batch(self) -> bool:
+        """Return whether buffered data can supply this rank's next actor update."""
+        if getattr(self, "_recv_queue", None) is None:
+            return False
+
+        next_version = int(self.version) + 1
+        min_eligible_version = next_version - self.cfg.algorithm.get(
+            "staleness_threshold", None
+        )
+        fresh_in_store = self.rollout_store.count_at_or_above(min_eligible_version)
+        with self._recv_queue_metadata_lock:
+            fresh_in_queue = sum(
+                count
+                for min_version, count in self._recv_version_counts.items()
+                if min_version >= min_eligible_version
+            )
+        return fresh_in_store + fresh_in_queue >= self.rollout_store_size
+
+    def _should_gate_actor_stage(self, *, require_rank_consensus: bool) -> bool:
+        """Gate selected actor compute only while rollout has fresh inventory."""
+        if self._actor_vlm_stage_gate is None:
+            return False
+
+        has_local_inventory = self._has_fresh_next_batch()
+        if not require_rank_consensus:
+            return has_local_inventory
+
+        all_ranks_have_inventory = torch.tensor(
+            int(has_local_inventory),
+            dtype=torch.int32,
+            device=torch.cuda.current_device(),
+        )
+        torch.distributed.all_reduce(
+            all_ranks_have_inventory,
+            op=torch.distributed.ReduceOp.MIN,
+        )
+        return bool(all_ranks_have_inventory.item())
 
     def prepare_overlap_replay(self, fixture_dir: str, stage: str) -> dict[str, Any]:
         from toolkits.overlap_profiler.timing import install_actor_replay
@@ -135,31 +195,37 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
     def _recv_rollout_thread_main(self, input_channel):
         while not self.should_stop:
             trajectory: Trajectory = input_channel.get()
+            min_version = float(trajectory.versions.min().item())
             self.log_info(
                 f"recv trajectory versions.shape={trajectory.versions.shape} "
                 f"input_channel.qsize={input_channel.qsize()}"
             )
-            if trajectory.versions.min() < self.version - self.cfg.algorithm.get(
+            if min_version < self.version - self.cfg.algorithm.get(
                 "staleness_threshold", None
             ):
                 continue
-            self._recv_queue.put(trajectory)
+            with self._recv_queue_metadata_lock:
+                self._recv_queue.put((min_version, trajectory))
+                self._recv_version_counts[min_version] += 1
 
     @Worker.timer("drain_received_trajectories")
     def _drain_received_trajectories(self):
         while True:
             try:
-                traj: Trajectory = self._recv_queue.get_nowait()
+                with self._recv_queue_metadata_lock:
+                    min_v, traj = self._recv_queue.get_nowait()
+                    self._recv_version_counts[min_v] -= 1
+                    if self._recv_version_counts[min_v] == 0:
+                        del self._recv_version_counts[min_v]
                 self.log_info(
                     f"drain traj versions.shape={traj.versions.shape} "
-                    f"versions.min={traj.versions.min()} version={self.version} "
+                    f"versions.min={min_v} version={self.version} "
                     f"recv_queue.size={self._recv_queue.qsize()}"
                 )
-                if traj.versions.min() < self.version - self.cfg.algorithm.get(
+                if min_v < self.version - self.cfg.algorithm.get(
                     "staleness_threshold", None
                 ):
                     continue
-                min_v = float(traj.versions.min().item())
                 mean_v = float(traj.versions.float().mean().item())
                 self.rollout_store.add((min_v, mean_v), traj)
                 self.log_info(f"rollout_store size={len(self.rollout_store)}")
@@ -526,23 +592,59 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
                         is_last_micro_batch=is_last_micro_batch,
                     )
 
-                    loss, metrics_data, entropy_loss = (
-                        self.forward_and_loss_micro_batch(data)
+                    gate_forward = bool(
+                        self.cfg.runner.get("actor_vlm_gate_forward", False)
+                    ) and self._should_gate_actor_stage(
+                        require_rank_consensus=True
                     )
+                    forward_gate_context = (
+                        self._actor_vlm_stage_gate.hold()
+                        if gate_forward
+                        else nullcontext()
+                    )
+                    with forward_gate_context:
+                        loss, metrics_data, entropy_loss = (
+                            self.forward_and_loss_micro_batch(data)
+                        )
 
                     backward_stage = (
                         ProfileStage.ACTOR_BACKWARD_SYNC
                         if is_last_micro_batch
                         else ProfileStage.ACTOR_BACKWARD_NO_SYNC
                     )
-                    with profile_range(backward_stage):
-                        with backward_ctx:
-                            self.grad_scaler.scale(loss).backward()
+                    gate_backward = bool(
+                        self.cfg.runner.get("actor_vlm_gate_backward", True)
+                    ) and self._should_gate_actor_stage(
+                        require_rank_consensus=is_last_micro_batch
+                    )
+                    backward_gate_context = (
+                        self._actor_vlm_stage_gate.hold()
+                        if gate_backward
+                        else nullcontext()
+                    )
+                    with backward_gate_context:
+                        with profile_range(backward_stage):
+                            with backward_ctx:
+                                self.grad_scaler.scale(loss).backward()
 
                     metrics_data["actor/entropy_loss"] = float(
                         entropy_loss.detach().item()
                     )
                     metrics_data["actor/total_loss"] = float(loss.detach().item())
+                    metrics_data["actor/forward_gate_enabled"] = float(gate_forward)
+                    metrics_data["actor/forward_gate_bypassed_no_buffer"] = float(
+                        self._actor_vlm_stage_gate is not None
+                        and self.cfg.runner.get("actor_vlm_gate_forward", False)
+                        and not gate_forward
+                    )
+                    metrics_data["actor/backward_gate_enabled"] = float(
+                        gate_backward
+                    )
+                    metrics_data["actor/backward_gate_bypassed_no_buffer"] = float(
+                        self._actor_vlm_stage_gate is not None
+                        and self.cfg.runner.get("actor_vlm_gate_backward", True)
+                        and not gate_backward
+                    )
                     append_to_dict(metrics, metrics_data)
 
                 with profile_range(ProfileStage.ACTOR_EMPTY_CACHE):

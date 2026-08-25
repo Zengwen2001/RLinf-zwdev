@@ -1175,6 +1175,10 @@ class PriorityStore:
                 self._used_seqs.discard(seq)
             self.sl.remove(item)
 
+    def count_at_or_above(self, threshold: float) -> int:
+        """Count trajectories whose minimum version meets ``threshold``."""
+        return sum(item[0][0] >= threshold for item in self.sl)
+
     def get_metric(self) -> dict:
         total_cells = 0
         counts: dict = {}

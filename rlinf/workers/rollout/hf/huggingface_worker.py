@@ -757,6 +757,7 @@ class MultiStepRolloutWorker(Worker):
                         merge_fn=self._merge_obs_batches,
                         infer_batch_size_fn=self._infer_env_batch_size,
                     ).async_wait()
+                await self._wait_for_inference_permission()
                 actions, result = self._predict_rollout_actions(
                     env_output["obs"],
                     final_obs=env_output.get("final_obs", None),
@@ -792,6 +793,7 @@ class MultiStepRolloutWorker(Worker):
                     merge_fn=self._merge_obs_batches,
                     infer_batch_size_fn=self._infer_env_batch_size,
                 ).async_wait()
+            await self._wait_for_inference_permission()
             actions, result = self._predict_rollout_actions(
                 env_output["obs"],
                 final_obs=env_output.get("final_obs", None),
@@ -834,6 +836,9 @@ class MultiStepRolloutWorker(Worker):
                     batch_size=self.train_batch_size,
                     split_fn=self._split_policy_output,
                 )
+
+    async def _wait_for_inference_permission(self) -> None:
+        """Allow async workers to gate policy inference at safe boundaries."""
 
     @Worker.timer("rollout/generate")
     async def generate(

@@ -58,6 +58,122 @@ The adapters do not create an alternative model-loading path. The controller
 instantiates them inside workers initialized with the production topology,
 coordinates A/B/AB execution, and collects timing samples.
 
+## Typical profiling commands
+
+Run all commands from the repository root. Reuse fixtures from a completed
+capture run and verify that the Nsight CLI is available before starting a trace:
+
+```bash
+cd /mnt/public/zengwen/RLinf-v03
+
+export OVERLAP_FIXTURE_DIR=/absolute/path/to/overlap_profile/fixtures
+
+test -d "${OVERLAP_FIXTURE_DIR}"
+command -v nsys
+nsys --version
+```
+
+### Timing-only compatibility matrix
+
+Use timing-only runs as the ground truth for isolated latency, slowdown, serial
+baseline, concurrent makespan, and net overlap benefit. Five warmups and ten
+formal repetitions are a practical default:
+
+```bash
+bash examples/embodiment/run_async.sh \
+  libero_spatial_async_ppo_openpi \
+  '+overlap_profile@runner.overlap_profile=openpi' \
+  runner.overlap_profile.warmup=5 \
+  runner.overlap_profile.repetitions=10
+```
+
+This runs the eight OpenPI pairs covering Actor Forward, Backward no-sync,
+Backward sync, and Optimizer against Rollout VLM and AE. Do not enable Nsight in
+this run when the objective is statistically stable timing.
+
+### Nsight CUDA/NVTX timeline
+
+Use one warmup and one formal repetition for a first timeline. This captures
+CUDA kernels, NVTX ranges, synchronization, memcpy, and NCCL intervals without
+GPU Metrics:
+
+```bash
+bash examples/embodiment/run_async.sh \
+  libero_spatial_async_ppo_openpi \
+  '+overlap_profile@runner.overlap_profile=openpi' \
+  '+profile@cluster.profiling=matrix_trace' \
+  runner.overlap_profile.profile_workers=true \
+  runner.overlap_profile.warmup=1 \
+  runner.overlap_profile.repetitions=1
+```
+
+Use this trace to verify actual kernel overlap and explain timing results. Do not
+use its single-sample latency as a replacement for the timing-only matrix.
+
+### Actor-side GPU Metrics
+
+Profile only one worker group per resource run. GPU Metrics are device-wide, so
+the Actor trace still observes total GPU pressure from concurrent Rollout work,
+while Actor NVTX and CUDA correlation provide the Actor completion window:
+
+```bash
+bash examples/embodiment/run_async.sh \
+  libero_spatial_async_ppo_openpi \
+  '+overlap_profile@runner.overlap_profile=openpi' \
+  '+profile@cluster.profiling=matrix_trace' \
+  runner.overlap_profile.profile_workers=true \
+  runner.overlap_profile.warmup=1 \
+  runner.overlap_profile.repetitions=1 \
+  'cluster.profiling.worker_groups=[ActorGroup]' \
+  '+cluster.profiling.options.gpu-metrics-devices=cuda-visible' \
+  '+cluster.profiling.options.gpu-metrics-frequency=2000'
+```
+
+This run supplies isolated and concurrent resource samples for Actor Forward,
+Backward, Optimizer, and NCCL intervals.
+
+### Rollout-side GPU Metrics
+
+Run a second resource trace with only RolloutGroup wrapped by Nsight. It supplies
+the VLM/AE completion windows and Rollout kernel attribution:
+
+```bash
+bash examples/embodiment/run_async.sh \
+  libero_spatial_async_ppo_openpi \
+  '+overlap_profile@runner.overlap_profile=openpi' \
+  '+profile@cluster.profiling=matrix_trace' \
+  runner.overlap_profile.profile_workers=true \
+  runner.overlap_profile.warmup=1 \
+  runner.overlap_profile.repetitions=1 \
+  'cluster.profiling.worker_groups=[RolloutGroup]' \
+  '+cluster.profiling.options.gpu-metrics-devices=cuda-visible' \
+  '+cluster.profiling.options.gpu-metrics-frequency=2000'
+```
+
+For a concurrent pair, the Actor and Rollout traces sample the same device-wide
+SM/Tensor/DRAM pressure but use different GPU envelopes. Keep both views: the
+Actor envelope answers why Actor completion changed, while the Rollout envelope
+answers why VLM or AE completion changed. Do not add or directly average the two
+device-wide measurements.
+
+The GA100 General Metrics set includes at least:
+
+```text
+GR Active [Throughput %]
+SMs Active [Throughput %]
+SM Issue [Throughput %]
+Tensor Active [Throughput %]
+DRAM Read Bandwidth [Throughput %]
+DRAM Write Bandwidth [Throughput %]
+NVLink and PCIe throughput metrics
+```
+
+`2000 Hz` is recommended for the 100--700 ms Backward/VLM/AE stages. A
+`10000 Hz` full-matrix run can export more than 40 million `GPU_METRICS` rows
+and about 1.6 GB of SQLite data per rank. Keep the compact `.nsys-rep` as the
+source artifact, aggregate the required stage windows to CSV, and treat exported
+SQLite files as temporary data.
+
 ## Run the pairwise matrix
 
 Use a fixture directory produced by a previous capture run:
